@@ -65,6 +65,9 @@ static SourceLocation getMacroDebugLoc(const CodeGenModule &CGM,
     return Loc;
   return CGM.getContext().getSourceManager().getFileLoc(Loc);
 }
+namespace llvm {
+extern cl::opt<bool> ThinLTOSplit;
+}
 
 static uint32_t getTypeAlignIfRequired(const Type *Ty, const ASTContext &Ctx) {
   auto TI = Ctx.getTypeInfo(Ty);
@@ -1443,7 +1446,7 @@ static SmallString<256> getTypeIdentifier(const TagType *Ty, CodeGenModule &CGM,
   if (!needsTypeIdentifier(TD, CGM, TheCU))
     return Identifier;
   if (const auto *RD = dyn_cast<CXXRecordDecl>(TD))
-    if (RD->getDefinition())
+    if (RD->getDefinition() && !llvm::ThinLTOSplit)
       if (RD->isDynamicClass() &&
           CGM.getVTableLinkage(RD) == llvm::GlobalValue::ExternalLinkage)
         return Identifier;

@@ -13,6 +13,7 @@ set(LLVM_LINK_COMPONENTS
   Target
   TargetParser
   ipo
+  Passes
   )
 
 add_llvm_tool(llvm-split
