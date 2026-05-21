@@ -107,52 +107,52 @@ extern cl::opt<bool> ThinLTOSplit;
 
 static std::mutex ForwardDiagMutex;
 
-struct ForwardingDiagHandler : public DiagnosticHandler { 
+struct ForwardingDiagHandler : public DiagnosticHandler {
   DiagnosticHandler *OrigHandler;
 
   ForwardingDiagHandler(DiagnosticHandler *Orig) : OrigHandler(Orig) {}
 
   bool isAnyRemarkEnabled() const override {
-    return OrigHandler ? OrigHandler->isAnyRemarkEnabled() : false; 
+    return OrigHandler ? OrigHandler->isAnyRemarkEnabled() : false;
   }
 
   bool isPassedOptRemarkEnabled(StringRef PassName) const override {
-    return OrigHandler ? OrigHandler->isPassedOptRemarkEnabled(PassName) : false; 
+    return OrigHandler ? OrigHandler->isPassedOptRemarkEnabled(PassName) : false;
   }
 
-  bool isMissedOptRemarkEnabled(StringRef PassName) const override { 
-    return OrigHandler ? OrigHandler->isMissedOptRemarkEnabled(PassName) : false; 
+  bool isMissedOptRemarkEnabled(StringRef PassName) const override {
+    return OrigHandler ? OrigHandler->isMissedOptRemarkEnabled(PassName) : false;
   }
-		   
+
   bool isAnalysisRemarkEnabled(StringRef PassName) const override {
-    return OrigHandler ? OrigHandler->isAnalysisRemarkEnabled(PassName) : false; 
+    return OrigHandler ? OrigHandler->isAnalysisRemarkEnabled(PassName) : false;
   }
 
   bool handleDiagnostics(const DiagnosticInfo &DI) override {
-    if (!OrigHandler) { 
-        return false; 
+    if (!OrigHandler) {
+        return false;
     }
     if (DI.getSeverity() == DS_Error) {
         std::lock_guard<std::mutex> Lock(ForwardDiagMutex);
         return OrigHandler->handleDiagnostics(DI);
     }
-    
+
     if (DI.getSeverity() != DS_Remark) {
-        return true; 
+        return true;
     }
 
     if (const auto *OptDiag = dyn_cast<DiagnosticInfoOptimizationBase>(&DI)) {
         StringRef PassName = OptDiag->getPassName();
         if (isa<OptimizationRemarkAnalysis>(&DI)) {
             if (!OrigHandler->isAnalysisRemarkEnabled(PassName)) {
-                return true; 
+                return true;
             }
-        } 
+        }
         else if (isa<OptimizationRemark>(&DI)) {
             if (!OrigHandler->isPassedOptRemarkEnabled(PassName)) {
                 return true;
             }
-        } 
+        }
         else if (isa<OptimizationRemarkMissed>(&DI)) {
             if (!OrigHandler->isMissedOptRemarkEnabled(PassName)) {
                 return true;
@@ -164,7 +164,7 @@ struct ForwardingDiagHandler : public DiagnosticHandler {
             }
         }
     }
-  
+
     std::lock_guard<std::mutex> Lock(ForwardDiagMutex);
     return OrigHandler->handleDiagnostics(DI);
   }

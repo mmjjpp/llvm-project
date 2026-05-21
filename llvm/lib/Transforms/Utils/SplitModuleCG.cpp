@@ -1,6 +1,7 @@
 #include "llvm/Transforms/Utils/SplitModuleCG.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Module.h"
@@ -62,6 +63,63 @@ static bool isVTable(const GlobalVariable *GV) {
     return true;
 
   return false;
+}
+
+static void dealWithDeclareDebugInfo(Module &MPart) {
+  for (Function &F : MPart)
+    if (F.isDeclaration())
+      F.setSubprogram(nullptr);
+}
+
+static void dealWithDuplicateDebugInfo(Module &MPart) {
+  DebugInfoFinder DIF;
+  DIF.processModule(MPart);
+  std::set<DICompileUnit *> NewCUs;
+  bool Changed = false;
+  for (DICompileUnit *DIC : DIF.compile_units()) {
+    // Deal with duplicate imported entities
+    SmallVector<Metadata *, 4> NewImports;
+    bool ChangedNewImports = false;
+    for (auto *IE : DIC->getImportedEntities()) {
+      if (auto *SP = dyn_cast_or_null<DISubprogram>(IE->getEntity())) {
+        if (!SP->isDefinition() || !MPart.getFunction(SP->getLinkageName())) {
+          ChangedNewImports = true;
+          continue;
+        }
+      }
+      NewImports.emplace_back(IE);
+    }
+    if (ChangedNewImports) {
+      DIC->replaceImportedEntities(MDTuple::get(MPart.getContext(), NewImports));
+      Changed = true;
+    }
+
+    // Deal with duplicate enum type
+    SmallVector<Metadata *, 4> NewEnumTypes;
+    bool ChangedEnumTypes = false;
+    for (auto *ET : DIC->getEnumTypes()) {
+      if (auto *SP = dyn_cast_or_null<DISubprogram>(ET->getScope())) {
+        Function *F = MPart.getFunction(SP->getLinkageName());
+        if (!F || (F->isDeclaration() && F->use_empty())) {
+          ChangedEnumTypes = true;
+          continue;
+        }
+        NewEnumTypes.emplace_back(ET);
+      }
+    }
+    if (ChangedEnumTypes) {
+      DIC->replaceEnumTypes(MDTuple::get(MPart.getContext(), NewEnumTypes));
+      Changed = true;
+    }
+
+    NewCUs.insert(DIC);
+  }
+  if (Changed) {
+    NamedMDNode *NMD = MPart.getOrInsertNamedMetadata("llvm.dbg.cu");
+    NMD->clearOperands();
+    for (DICompileUnit *CU : NewCUs)
+      NMD->addOperand(CU);
+  }
 }
 } // namespace
 
@@ -357,6 +415,8 @@ bool SplitModuleCG::isInitArrayAnchorMember(const GlobalValue *GV) const {
 
 void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I,
                                   function_ref<bool(const GlobalValue *)> NeedsConservativeImport) {
+  dealWithDuplicateDebugInfo(MPart);
+  dealWithDeclareDebugInfo(MPart);
   // collect symbols to rename
   auto checkPromoted = [&](const GlobalValue &GV) {
     // now is external (not local), but not in external set.
