@@ -692,11 +692,17 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C,
                                    bool IsThinLTO = true) {
   const Target *T = &TM->getTarget();
 
+  bool GlobalTimeTraceEnabled = llvm::timeTraceProfilerEnabled();
+
   SplitModuleCG SplitModuleCG(Mod, CombinedIndex, ParallelCodeGenParallelismLevel);
   ParallelCodeGenParallelismLevel = SplitModuleCG.getPartitionNum();
 
   const auto HandleModulePartition = [&](std::unique_ptr<Module> MPart,
                                          unsigned PartitionId) {
+    bool NeedLocalProfiler = GlobalTimeTraceEnabled && !llvm::timeTraceProfilerEnabled();
+    if(NeedLocalProfiler) {
+      llvm::timeTraceProfilerInitialize(0, "Thinlto-BackEnd");
+    }
     std::unique_ptr<TargetMachine> ThreadTM = createTargetMachine(C, T, *MPart);
 
     if (DoOpt) {
@@ -731,6 +737,18 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C,
     // to be reconstructed to support emitting multiple split submodules.
     codegen(C, ThreadTM.get(), AddStream, PartitionId, *MPart,
             CombinedIndex);
+    if (NeedLocalProfiler) {
+      std::string TraceFilename = "thinlto-task" + std::to_string(task) + "-thread-" +std::to_string(PartitionId) + ".json";
+      std::error_code EC;
+      raw_fd_ostream OS(TraceFilename, EC, sys::fs::OF_Text);
+      if(!EC) {
+        llvm::timeTraceProfilerWrite(OS);
+        OS.flush();
+      } else {
+          llvm::errs() << "[TimeTrace] Error writing " << TraceFilename << ":" << EC.message() << "\n";
+      }
+      llvm::timeTraceProfilerCleanup();
+    }
   };
 
   SplitModuleCG.SplitModule(HandleModulePartition, C);
