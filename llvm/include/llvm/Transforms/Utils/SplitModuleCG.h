@@ -3,6 +3,7 @@
 
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Analysis/CallGraph.h"
+#include "llvm/Analysis/IndirectCallPromotionAnalysis.h"
 #include "llvm/Analysis/ModuleSummaryAnalysis.h"
 #include "llvm/LTO/Config.h"
 #include "llvm/ADT/DenseMap.h"
@@ -26,7 +27,7 @@ public:
   explicit SimplifyCallGraph(CallGraph &CG,
                              const ModuleSummaryIndex &CombinedIndex,
                              Module &M)
-      : CG(CG) {
+      : CG(CG), M(M) {
     createSimplifyCallGraph(CombinedIndex);
   }
   ~SimplifyCallGraph() {};
@@ -71,9 +72,16 @@ public:
   void createSimplifyCallGraph(const ModuleSummaryIndex &CombinedIndex);
   void print();
   SimplifyCallGraphNode *getOrInsertFunction(const Function *F);
+  void traceIndirectCallUsage(Value *V, Function *F,
+                              SimplifyCallGraphNode *SCGNode, int Depth);
+  Function *resolveIndirectCalls(
+      Instruction *I, SimplifyCallGraphNode *SCGNode,
+      DenseMap<uint64_t, const Function *> &GUIDFuntionMap,
+      ICallPromotionAnalysis &ICallAnalysis);
 
 private:
   CallGraph &CG;
+  Module &M;
 };
 
 class SimplifyCallGraphNode {
