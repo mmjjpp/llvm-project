@@ -8,7 +8,11 @@
 #include "llvm/IR/Value.h"
 #include "llvm/Support/MD5.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include <mutex>
 #include <thread>
+
+static std::mutex split_module_mtx;
+
 using namespace llvm;
 
 #define DEBUG_TYPE "split-module-CG"
@@ -18,6 +22,10 @@ namespace {
 static cl::opt<bool> enablePrintSimplifyCallGraph(
     "enable-print-simplify-callgraph", cl::Hidden, cl::init(false),
     cl::desc("print SimplifyCallGraph"));
+
+static cl::opt<bool> ParallelCloneModule(
+    "parallel-cloneModule", cl::Hidden, cl::init(false),
+    cl::desc("parallel clone module"));
 
 using PartitionID = unsigned;
 
@@ -421,6 +429,7 @@ void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I,
   auto checkPromoted = [&](const GlobalValue &GV) {
     // now is external (not local), but not in external set.
     if (!GV.hasLocalLinkage() && !OriginalExternals.contains(GV.getName())) {
+      std::lock_guard<std::mutex> lock(split_module_mtx);
       if (PromotedRenames.count(GV.getName()))
         return;
       MD5 Hash;
@@ -452,58 +461,64 @@ void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I,
       GV.eraseFromParent();
   }
 
-  for (auto &func : MPart.functions()) {
-    auto Fn = M.getFunction(func.getName());
-    if (Fn && isInitArrayAnchor(Fn) && I != 0 && !func.isDeclaration()) {
-      AvailableExternalizeFunc(func);
-      continue;
-    }
-    // Ensure that the alias and aliasee are defined in the same partition, and
-    // that the ifunc and its resolver are also defined in the same partition.
-    if (externalFunction.count(Fn) &&
-        (AliasedFuncs.contains(Fn) || IfuncResolver.contains(Fn))) {
-      if (I != 0 && !func.isDeclaration()) {
+  // TODO: Ensure deterministic linkage across parallel partitions. Linkage must
+  // be synchronized before cloning to prevent race conditions and
+  // inconsistent binary output.
+  {
+    std::lock_guard<std::mutex> lock(split_module_mtx);
+    for (auto &func : MPart.functions()) {
+      auto Fn = M.getFunction(func.getName());
+      if (Fn && isInitArrayAnchor(Fn) && I != 0 && !func.isDeclaration()) {
         AvailableExternalizeFunc(func);
         continue;
       }
-    }
-    if (externalFunction.count(Fn) && !func.isDeclaration()) {
-      if (!externalFunction[Fn]) {
-        AvailableExternalizeFunc(func);
-      } else {
-        externalFunction[Fn] = false;
+      // Ensure that the alias and aliasee are defined in the same partition, and
+      // that the ifunc and its resolver are also defined in the same partition.
+      if (externalFunction.count(Fn) &&
+          (AliasedFuncs.contains(Fn) || IfuncResolver.contains(Fn))) {
+        if (I != 0 && !func.isDeclaration()) {
+          AvailableExternalizeFunc(func);
+          continue;
+        }
+      }
+      if (externalFunction.count(Fn) && !func.isDeclaration()) {
+        if (!externalFunction[Fn]) {
+          AvailableExternalizeFunc(func);
+        } else {
+          externalFunction[Fn] = false;
+        }
       }
     }
-  }
 
-  // Handle InitArray anchors
-  for (auto &GV : MPart.globals()) {
-    auto *GVInM = M.getNamedGlobal(GV.getName());
-    if (GVInM && isInitArrayAnchorMember(GVInM) && I != 0 &&
-        !GV.isDeclaration()) {
-      AvailableExternalizeGV(GV);
-    }
-  }
-  // if a function is available externally, we need to ensure its globals
-  // (which have same comdat as the function) are too.
-  for (auto &func : MPart.functions()) {
-    auto FinM = M.getFunction(func.getName());
-    if (!FinM || FinM->isDeclaration() || !func.hasAvailableExternallyLinkage())
-      continue;
-    for (auto GVinM : GVRecord[FinM]) {
-      auto GV = MPart.getNamedGlobal(GVinM->getName());
-      AvailableExternalizeGV(*GV);
-    }
-  }
-  // Ensure that the global variable is external in one partition and available
-  // external in other partitions. This can avoid duplicate conflicts.
-  for (auto &GV : MPart.globals()) {
-    auto GVinM = M.getGlobalVariable(GV.getName());
-    if (ExternalGValues.count(GVinM) && !GV.isDeclaration()) {
-      if (!ExternalGValues[GVinM]) {
+    // Handle InitArray anchors
+    for (auto &GV : MPart.globals()) {
+      auto *GVInM = M.getNamedGlobal(GV.getName());
+      if (GVInM && isInitArrayAnchorMember(GVInM) && I != 0 &&
+          !GV.isDeclaration()) {
         AvailableExternalizeGV(GV);
-      } else {
-        ExternalGValues[GVinM] = false;
+      }
+    }
+    // if a function is available externally, we need to ensure its globals
+    // (which have same comdat as the function) are too.
+    for (auto &func : MPart.functions()) {
+      auto FinM = M.getFunction(func.getName());
+      if (!FinM || FinM->isDeclaration() || !func.hasAvailableExternallyLinkage())
+        continue;
+      for (auto GVinM : GVRecord[FinM]) {
+        auto GV = MPart.getNamedGlobal(GVinM->getName());
+        AvailableExternalizeGV(*GV);
+      }
+    }
+    // Ensure that the global variable is external in one partition and available
+    // external in other partitions. This can avoid duplicate conflicts.
+    for (auto &GV : MPart.globals()) {
+      auto GVinM = M.getGlobalVariable(GV.getName());
+      if (ExternalGValues.count(GVinM) && !GV.isDeclaration()) {
+        if (!ExternalGValues[GVinM]) {
+          AvailableExternalizeGV(GV);
+        } else {
+          ExternalGValues[GVinM] = false;
+        }
       }
     }
   }
@@ -651,40 +666,75 @@ void SplitModuleCG::SplitModule(ModuleCreationCallback ModuleCallback,
     return I == 0;
   };
 
-  // TODO: In the future, it may be considered to also include clonemodule in
-  // parallel to reduce compilation time.
   std::vector<std::thread> Threads;
   Threads.reserve(N);
-  std::vector<std::unique_ptr<Module>> MPartInCtxs;
-  MPartInCtxs.resize(N);
-  for (unsigned I = 0; I < N; ++I) {
-    ValueToValueMapTy VMap;
-    std::unique_ptr<Module> MPart(
-      CloneModule(M, VMap, [&](const GlobalValue *GV) {
-        return ShouldCloneDefinition(I, GV);
-    }));
-
-    dealWithMpart(*MPart, I, NeedsConservativeImport);
-
-    // If not clone module in multi-thread, we also need to clone
-    // the module obtained through segmentation into a new context
-    // to avoid data races.
+  if (ParallelCloneModule) {
+    // We want to clone the whole module into a new context to multi-thread
+    // the cloneModule. We do it by serializing the whole module to bitcode
+    // (while still on the main thread, in order to avoid data races) and
+    // spinning up new threads which deserialize the copies into
+    // separate contexts.
     SmallString<0> BC;
     raw_svector_ostream BCOS(BC);
-    WriteBitcodeToFile(*MPart, BCOS);
-    MPart.reset();
-    Threads.emplace_back([&, I](SmallString<0> BC) {
-      llvm::lto::LTOLLVMContext Ctx(C);
-      Expected<std::unique_ptr<Module>> MOrErr = parseBitcodeFile(
-          MemoryBufferRef(BC.str(), "ld-temp.o"), Ctx);
-      BC = SmallString<0>();
-      if (!MOrErr)
-        report_fatal_error("Failed to read bitcode");
-      ModuleCallback(std::move(MOrErr.get()), I);
-    }, std::move(BC));
+    WriteBitcodeToFile(M, BCOS);
+    Expected<BitcodeModule> BMOrErr =
+        parseBitcodeFileStream(MemoryBufferRef(BC.str(), "ld-temp.o"));
+    if (!BMOrErr)
+      report_fatal_error("Failed to read bitcode");
+    BitcodeModule BM = std::move(BMOrErr.get());
+    for (unsigned I = 0; I < N; ++I) {
+      Threads.emplace_back([&, I]() {
+        std::unique_ptr<Module> MPart;
+        llvm::lto::LTOLLVMContext Ctx(C);
+        {
+          Expected<std::unique_ptr<Module>> MOrErr = BM.parseModule(Ctx);
+          if (!MOrErr)
+            report_fatal_error("Failed to read bitcode");
+          std::unique_ptr<Module> MInCtx = std::move(MOrErr.get());
+          ValueToValueMapTy VMap;
+          MPart = CloneModule(*MInCtx, VMap, [&](const GlobalValue *GV) {
+            return ShouldCloneDefinition(I, GV);
+          });
+        }
+
+        dealWithMpart(*MPart, I, NeedsConservativeImport);
+        ModuleCallback(std::move(MPart), I);
+      });
+    }
+    for (auto &T : Threads)
+      T.join();
+  } else {
+    std::vector<std::unique_ptr<Module>> MPartInCtxs;
+    MPartInCtxs.resize(N);
+    for (unsigned I = 0; I < N; ++I) {
+      ValueToValueMapTy VMap;
+      std::unique_ptr<Module> MPart(
+        CloneModule(M, VMap, [&](const GlobalValue *GV) {
+          return ShouldCloneDefinition(I, GV);
+      }));
+
+      dealWithMpart(*MPart, I, NeedsConservativeImport);
+
+      // If not clone module in multi-thread, we also need to clone
+      // the module obtained through segmentation into a new context
+      // to avoid data races.
+      SmallString<0> BC;
+      raw_svector_ostream BCOS(BC);
+      WriteBitcodeToFile(*MPart, BCOS);
+      MPart.reset();
+      Threads.emplace_back([&, I](SmallString<0> BC) {
+        llvm::lto::LTOLLVMContext Ctx(C);
+        Expected<std::unique_ptr<Module>> MOrErr = parseBitcodeFile(
+            MemoryBufferRef(BC.str(), "ld-temp.o"), Ctx);
+        BC = SmallString<0>();
+        if (!MOrErr)
+          report_fatal_error("Failed to read bitcode");
+        ModuleCallback(std::move(MOrErr.get()), I);
+      }, std::move(BC));
+    }
+    for (auto &T : Threads)
+      T.join();
   }
-  for (auto &T : Threads)
-    T.join();
 }
 
 SplitModuleCG::SplitModuleCG(Module &M,
