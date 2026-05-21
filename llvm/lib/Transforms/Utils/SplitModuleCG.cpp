@@ -27,6 +27,10 @@ static cl::opt<bool> ParallelCloneModule(
     "parallel-cloneModule", cl::Hidden, cl::init(false),
     cl::desc("parallel clone module"));
 
+static cl::opt<bool>
+   SerialParseModule("serial-parse-module", cl::Hidden, cl::init(false),
+              cl::desc("serial parse module"));
+
 using PartitionID = unsigned;
 
 static void externalize(GlobalValue *GV) {
@@ -721,16 +725,32 @@ void SplitModuleCG::SplitModule(ModuleCreationCallback ModuleCallback,
       SmallString<0> BC;
       raw_svector_ostream BCOS(BC);
       WriteBitcodeToFile(*MPart, BCOS);
-      MPart.reset();
-      Threads.emplace_back([&, I](SmallString<0> BC) {
-        llvm::lto::LTOLLVMContext Ctx(C);
-        Expected<std::unique_ptr<Module>> MOrErr = parseBitcodeFile(
-            MemoryBufferRef(BC.str(), "ld-temp.o"), Ctx);
-        BC = SmallString<0>();
-        if (!MOrErr)
-          report_fatal_error("Failed to read bitcode");
-        ModuleCallback(std::move(MOrErr.get()), I);
-      }, std::move(BC));
+      if (SerialParseModule) {
+        auto CtxPtr = std::make_shared<llvm::lto::LTOLLVMContext>(C);
+        {
+          Expected<std::unique_ptr<Module>> MOrErr = parseBitcodeFile(
+              MemoryBufferRef(BC.str(), "ld-temp.o"),
+              *CtxPtr);
+          BC = SmallString<0>();
+          if (!MOrErr)
+            report_fatal_error("Failed to read bitcode");
+          MPartInCtxs[I] = std::move(MOrErr.get());
+        }
+        Threads.emplace_back([&, I, CtxPtr]() {
+          ModuleCallback(std::move(MPartInCtxs[I]), I);
+        });
+      } else {
+        MPart.reset();
+        Threads.emplace_back([&, I](SmallString<0> BC) {
+          llvm::lto::LTOLLVMContext Ctx(C);
+          Expected<std::unique_ptr<Module>> MOrErr = parseBitcodeFile(
+              MemoryBufferRef(BC.str(), "ld-temp.o"), Ctx);
+          BC = SmallString<0>();
+          if (!MOrErr)
+            report_fatal_error("Failed to read bitcode");
+          ModuleCallback(std::move(MOrErr.get()), I);
+        }, std::move(BC));
+      }
     }
     for (auto &T : Threads)
       T.join();
