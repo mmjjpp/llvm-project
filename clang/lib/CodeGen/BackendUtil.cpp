@@ -17,6 +17,7 @@
 #include "clang/Frontend/Utils.h"
 #include "clang/Lex/HeaderSearchOptions.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/RuntimeLibcallInfo.h"
@@ -54,6 +55,7 @@
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
@@ -92,7 +94,9 @@
 #include "llvm/Transforms/Utils/Debugify.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 using namespace clang;
 using namespace llvm;
@@ -1307,6 +1311,29 @@ void EmitAssemblyHelper::emitAssembly(BackendAction Action,
     DwoOS->keep();
 }
 
+static std::string getThinLTOSplitOutputFile(const FrontendOptions &Opts,
+                                             size_t Task) {
+  return (Twine(Opts.OutputFile) + ".thinlto-split." + Twine(Task) + ".o")
+      .str();
+}
+
+static bool writeThinLTOSplitOutputList(DiagnosticsEngine &Diags,
+                                        StringRef OutputList,
+                                        ArrayRef<std::string> Outputs) {
+  std::error_code EC;
+  raw_fd_ostream OS(OutputList, EC, sys::fs::OF_Text);
+  if (EC) {
+    Diags.Report(diag::err_fe_unable_to_open_output)
+        << OutputList << EC.message();
+    return false;
+  }
+  for (StringRef Output : Outputs) {
+    sys::printArg(OS, Output, /*Quote=*/true);
+    OS << '\n';
+  }
+  return true;
+}
+
 static void
 runThinLTOBackend(CompilerInstance &CI, ModuleSummaryIndex *CombinedIndex,
                   llvm::Module *M, std::unique_ptr<raw_pwrite_stream> OS,
@@ -1329,11 +1356,35 @@ runThinLTOBackend(CompilerInstance &CI, ModuleSummaryIndex *CombinedIndex,
   if (!lto::initImportList(*M, *CombinedIndex, ImportList))
     return;
 
-  auto AddStream = [&](size_t Task, const Twine &ModuleName) {
+  const std::string &SplitOutputList =
+      CI.getFrontendOpts().ThinLTOSplitOutputList;
+  std::map<size_t, std::string> SplitOutputMap;
+  std::mutex SplitOutputFilesMutex;
+
+  auto AddStream = [&](size_t Task, const Twine &/*ModuleName*/)
+      -> Expected<std::unique_ptr<CachedFileStream>> {
+    if (!SplitOutputList.empty()) {
+      std::unique_ptr<raw_pwrite_stream> OutputOS;
+      std::string OutputPath =
+          getThinLTOSplitOutputFile(CI.getFrontendOpts(), Task);
+      {
+        std::lock_guard<std::mutex> Lock(SplitOutputFilesMutex);
+        SplitOutputMap[Task] = OutputPath;
+      }
+
+      std::error_code EC;
+      OutputOS =
+          std::make_unique<raw_fd_ostream>(OutputPath, EC, sys::fs::OF_None);
+      if (EC)
+        return errorCodeToError(EC);
+      return std::make_unique<CachedFileStream>(std::move(OutputOS),
+                                                OutputPath);
+    }
     return std::make_unique<CachedFileStream>(std::move(OS),
                                               CGOpts.ObjectFilenameForDebug);
   };
   lto::Config Conf;
+  Conf.AcceptsMultipleOutputsPerTask = !SplitOutputList.empty();
   if (CGOpts.SaveTempsFilePrefix != "") {
     if (Error E = Conf.addSaveTemps(CGOpts.SaveTempsFilePrefix + ".",
                                     /* UseInputModulePath */ false)) {
@@ -1384,6 +1435,16 @@ runThinLTOBackend(CompilerInstance &CI, ModuleSummaryIndex *CombinedIndex,
   Conf.RemarksFormat = CGOpts.OptRecordFormat;
   Conf.SplitDwarfFile = CGOpts.SplitDwarfFile;
   Conf.SplitDwarfOutput = CGOpts.SplitDwarfOutput;
+  // Split partitions need distinct .dwo files for both split and single
+  // fission modes.
+  if (!SplitOutputList.empty() && !CGOpts.SplitDwarfFile.empty()) {
+    SmallString<128> DwoStem(CGOpts.SplitDwarfOutput.empty()
+                                ? CGOpts.SplitDwarfFile
+                                : CGOpts.SplitDwarfOutput);
+    if (llvm::sys::path::extension(DwoStem) == ".dwo")
+      llvm::sys::path::replace_extension(DwoStem, "");
+    Conf.SplitDwarfOutputStem = std::string(DwoStem);
+  }
   for (auto &Plugin : CI.getPassPlugins())
     Conf.LoadedPassPlugins.push_back(Plugin.get());
   switch (Action) {
@@ -1423,6 +1484,14 @@ runThinLTOBackend(CompilerInstance &CI, ModuleSummaryIndex *CombinedIndex,
       errs() << "Error running ThinLTO backend: " << EIB.message() << '\n';
     });
   }
+
+  if (!SplitOutputList.empty()) {
+    SmallVector<std::string, 0> Outputs;
+    for (const auto &Pair : SplitOutputMap)
+      Outputs.push_back(Pair.second);
+    if (!writeThinLTOSplitOutputList(Diags, SplitOutputList, Outputs))
+      return;
+  }
 }
 
 void clang::emitBackendOutput(CompilerInstance &CI, CodeGenOptions &CGOpts,
@@ -1433,6 +1502,14 @@ void clang::emitBackendOutput(CompilerInstance &CI, CodeGenOptions &CGOpts,
                               BackendConsumer *BC) {
   llvm::TimeTraceScope TimeScope("Backend");
   DiagnosticsEngine &Diags = CI.getDiagnostics();
+
+  // When split codegen is active, cc1's -o stream should never receive
+  // partition content. The driver owns the final -o via ld.lld -r, and each
+  // partition is written to its own .thinlto-split.N.o file by the AddStream
+  // callback in runThinLTOBackend. Replace the original OS with a null stream
+  // to avoid opening or writing the user-specified -o path at all.
+  if (!CI.getFrontendOpts().ThinLTOSplitOutputList.empty())
+    OS = std::make_unique<raw_null_ostream>();
 
   std::unique_ptr<llvm::Module> EmptyModule;
   if (!CGOpts.ThinLTOIndexFile.empty()) {
@@ -1474,8 +1551,37 @@ void clang::emitBackendOutput(CompilerInstance &CI, CodeGenOptions &CGOpts,
     }
   }
 
+  // When split codegen is active, the skip/fallback path must emit its object
+  // to the partition-0 filename instead of the original -o. The original OS
+  // was replaced with a null stream above.
+  if (!CI.getFrontendOpts().ThinLTOSplitOutputList.empty()) {
+    std::string FallbackOutputPath =
+        getThinLTOSplitOutputFile(CI.getFrontendOpts(), 0);
+    std::error_code EC;
+    auto FallbackOS = std::make_unique<raw_fd_ostream>(FallbackOutputPath, EC,
+                                                       sys::fs::OF_None);
+    if (EC) {
+      Diags.Report(diag::err_fe_unable_to_open_output)
+          << FallbackOutputPath << EC.message();
+      return;
+    }
+    OS = std::move(FallbackOS);
+  }
+
   EmitAssemblyHelper AsmHelper(CI, CGOpts, M, VFS);
   AsmHelper.emitAssembly(Action, std::move(OS), BC);
+
+  if (!CI.getFrontendOpts().ThinLTOSplitOutputList.empty()) {
+    // If distributed ThinLTO indexing skips this backend, runThinLTOBackend is
+    // bypassed. Keep the driver merge action valid by listing the object
+    // emitted above. The real split path writes only partition objects.
+    std::string FallbackOutputPath =
+        getThinLTOSplitOutputFile(CI.getFrontendOpts(), 0);
+    if (!writeThinLTOSplitOutputList(
+            Diags, CI.getFrontendOpts().ThinLTOSplitOutputList,
+            ArrayRef<std::string>(&FallbackOutputPath, 1)))
+      return;
+  }
 
   // Verify clang's TargetInfo DataLayout against the LLVM TargetMachine's
   // DataLayout.

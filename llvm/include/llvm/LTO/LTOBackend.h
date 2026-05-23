@@ -34,6 +34,14 @@ class Target;
 
 namespace lto {
 
+/// Returns true if ThinLTO split codegen (`-thinlto-split`) is requested, in
+/// which case one logical task may emit several native objects.
+LLVM_ABI bool isThinLTOSplitEnabled();
+
+/// Upper bound on partition objects per task when split is active: the
+/// configured `-thinlto-split-partitions`, or 0 (no static bound) / 1 (off).
+LLVM_ABI unsigned getThinLTOSplitMaxPartitions();
+
 /// Runs middle-end LTO optimizations on \p Mod.
 LLVM_ABI bool opt(const Config &Conf, TargetMachine *TM, unsigned Task,
                   Module &Mod, bool IsThinLTO,

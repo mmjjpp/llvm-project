@@ -32,6 +32,11 @@ static void externalize(GlobalValue *GV) {
     GV->setName("__llvmsplit_unnamed");
 }
 
+static void dealWithDeclareDebugInfo(Module &MPart) {
+  for (Function &F : MPart)
+    if (F.isDeclaration())
+      F.setSubprogram(nullptr);
+}
 } // namespace
 
 std::vector<DenseSet<const Function *>> SplitModuleCG::doPartitioning() {
@@ -109,6 +114,7 @@ void SplitModuleCG::calculateFunctionCosts() {
 
 void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I,
                                   function_ref<bool(const GlobalValue *)> NeedsConservativeImport) {
+  dealWithDeclareDebugInfo(MPart);
   // collect symbols to rename
   auto checkPromoted = [&](const GlobalValue &GV) {
     // now is external (not local), but not in external set.

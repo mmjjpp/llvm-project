@@ -264,6 +264,32 @@ public:
   void setEnvironment(llvm::ArrayRef<const char *> NewEnvironment) override;
 };
 
+/// Merges the per-partition objects from ThinLTO split codegen into one
+/// relocatable object (`ld.lld -r`). The partition count is only known at
+/// codegen time, so after the merge this reads the response file to remove
+/// them (unless -save-temps); the response file is a normal Compilation temp.
+class ThinLTOMergeCommand : public Command {
+  /// Response file listing the partition objects to merge.
+  std::string SplitOutputList;
+
+  /// Whether to remove the partition objects after a successful merge (false
+  /// under -save-temps).
+  bool CleanupSplitOutputs;
+
+  void cleanupSplitOutputs() const;
+
+public:
+  ThinLTOMergeCommand(const Action &Source, const Tool &Creator,
+                      ResponseFileSupport ResponseSupport,
+                      const char *Executable,
+                      const llvm::opt::ArgStringList &Arguments,
+                      ArrayRef<InputInfo> Inputs, ArrayRef<InputInfo> Outputs,
+                      StringRef SplitOutputList, bool CleanupSplitOutputs);
+
+  int Execute(ArrayRef<std::optional<StringRef>> Redirects, std::string *ErrMsg,
+              bool *ExecutionFailed) const override;
+};
+
 /// JobList - A sequence of jobs to perform.
 class JobList {
 public:

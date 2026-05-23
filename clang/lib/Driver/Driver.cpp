@@ -59,6 +59,7 @@
 #include "clang/Basic/Version.h"
 #include "clang/Config/config.h"
 #include "clang/Driver/Action.h"
+#include "clang/Driver/CommonArgs.h"
 #include "clang/Driver/Compilation.h"
 #include "clang/Driver/InputInfo.h"
 #include "clang/Driver/Job.h"
@@ -4623,8 +4624,18 @@ void Driver::BuildActions(Compilation &C, DerivedArgList &Args,
     }
 
     // If we ended with something, add to the output list.
-    if (Current)
+    if (Current) {
+      // ThinLTO split codegen has cc1 emit one object per partition; append a
+      // merge action (`ld.lld -r`) to recombine them. Gating must match the cc1
+      // side in Clang::ConstructJob; both use isThinLTOSplitMergeEnabled.
+      if (Current->getType() == types::TY_Object &&
+          tools::isThinLTOSplitMergeEnabled(C.getDefaultToolChain(), Args)) {
+        ActionList Inputs;
+        Inputs.push_back(Current);
+        Current = C.MakeAction<ThinLTOMergeJobAction>(Inputs, types::TY_Object);
+      }
       Actions.push_back(Current);
+    }
 
     // Add any top level actions generated for offloading.
     if (!UseNewOffloadingDriver)
@@ -5721,7 +5732,16 @@ class ToolSelector final {
 
   /// Return true if an assemble action can be collapsed.
   bool canCollapseAssembleAction() const {
-    return TC.useIntegratedAs() && !SaveTemps &&
+    // ThinLTO split codegen requires multiple native object outputs per task
+    // (AcceptsMultipleOutputsPerTask), which the assembly emission path (-S)
+    // cannot provide. When -save-temps would normally prevent collapsing the
+    // assemble step, still collapse it for the ELF ThinLTO split backend case
+    // so cc1 emits objects directly rather than going through assembly.
+    bool SaveTempsBlock = SaveTemps &&
+      !(C.getArgs().hasArg(options::OPT_fthinlto_index_EQ) &&
+        TC.getTriple().isOSBinFormatELF() &&
+        tools::isThinLTOSplitEnabled(C.getArgs()));
+    return TC.useIntegratedAs() && !SaveTempsBlock &&
            !C.getArgs().hasArg(options::OPT_via_file_asm) &&
            !C.getArgs().hasArg(options::OPT__SLASH_FA) &&
            !C.getArgs().hasArg(options::OPT__SLASH_Fa) &&

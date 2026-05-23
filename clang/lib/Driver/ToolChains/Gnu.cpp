@@ -27,6 +27,7 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/Support/CodeGen.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/TargetParser/RISCVISAInfo.h"
@@ -279,6 +280,46 @@ void tools::gnutools::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   // Generic_ELF instead.
   const auto &ToolChain = static_cast<const Generic_ELF &>(getToolChain());
   const Driver &D = ToolChain.getDriver();
+
+  // ThinLTOMergeJobAction is ELF-only. See ToolChain::SelectTool for the
+  // routing assertion and Driver::BuildActions for the ELF pre-condition.
+  if (isa<ThinLTOMergeJobAction>(JA)) {
+    ArgStringList CmdArgs;
+    const char *BaseInput = nullptr;
+    for (const auto &II : Inputs) {
+      if (II.isFilename()) {
+        BaseInput = II.getFilename();
+        break;
+      }
+    }
+    assert(BaseInput && "ThinLTO merge job requires an input file");
+
+    // Response file cc1 wrote the partition objects to (shared helper keeps the
+    // name in sync with Clang::ConstructJob). Register it as a Compilation
+    // temporary so it is cleaned up normally (honoring -save-temps).
+    const char *ResponseFile =
+        Args.MakeArgString(tools::getThinLTOSplitResponseFile(BaseInput));
+    C.addTempFile(ResponseFile);
+
+    CmdArgs.push_back("-r");
+    CmdArgs.push_back("-o");
+    CmdArgs.push_back(Output.getFilename());
+    CmdArgs.push_back(Args.MakeArgString(Twine("@") + ResponseFile));
+
+    // Use clang's normal program lookup so -B and configured program paths can
+    // select the matching ld.lld.
+    std::string LLDPath = ToolChain.GetProgramPath("ld.lld");
+    if (!llvm::sys::fs::can_execute(LLDPath)) {
+      D.Diag(clang::diag::err_drv_lto_split_requires_lld) << LLDPath;
+      return;
+    }
+    const char *Exec = Args.MakeArgString(LLDPath);
+
+    C.addCommand(std::make_unique<ThinLTOMergeCommand>(
+        JA, *this, ResponseFileSupport::AtFileCurCP(), Exec, CmdArgs, Inputs,
+        Output, ResponseFile, !D.isSaveTempsEnabled()));
+    return;
+  }
 
   const llvm::Triple &Triple = getToolChain().getEffectiveTriple();
 

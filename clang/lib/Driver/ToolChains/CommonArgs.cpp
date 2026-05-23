@@ -941,6 +941,38 @@ llvm::StringRef tools::getLTOParallelism(const ArgList &Args, const Driver &D) {
   return LtoJobsArg->getValue();
 }
 
+bool tools::isThinLTOSplitEnabled(const ArgList &Args) {
+  std::optional<bool> Enabled;
+  for (const Arg *A : Args.filtered(options::OPT_mllvm)) {
+    for (size_t I = 0, E = A->getNumValues(); I != E; ++I) {
+      StringRef V = A->getValue(I);
+      if (V == "-thinlto-split" || V == "-thinlto-split=true")
+        Enabled = true;
+      else if (V == "-thinlto-split=false")
+        Enabled = false;
+    }
+  }
+  return Enabled.value_or(false);
+}
+
+std::string tools::getThinLTOSplitResponseFile(StringRef Output) {
+  return (Twine(Output) + ".thinlto-split.rsp").str();
+}
+
+bool tools::isThinLTOSplitMergeEnabled(const ToolChain &TC,
+                                       const ArgList &Args) {
+  // Driver-mediated split applies to the distributed backend compile only: cc1
+  // (-fthinlto-index) emits one object per partition and the driver merges them
+  // with `ld.lld -r`. Gated on -c because the merged object must be the final
+  // output; without -c the object feeds a link step and there is no merge action
+  // (link-time splitting is then handled inside the linker itself). This is the
+  // single gating predicate shared by the cc1 flag and the merge action.
+  return isThinLTOSplitEnabled(Args) &&
+         Args.hasArg(options::OPT_fthinlto_index_EQ) &&
+         Args.hasArg(options::OPT_c) && TC.getTriple().isOSBinFormatELF() &&
+         TC.canConstructThinLTOMergeJob();
+}
+
 // PS4/PS5 uses -ffunction-sections and -fdata-sections by default.
 bool tools::isUseSeparateSections(const llvm::Triple &Triple) {
   return Triple.isPS();

@@ -19,9 +19,12 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "llvm/Support/Allocator.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/CrashRecoveryContext.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/IOSandbox.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/Program.h"
@@ -450,6 +453,47 @@ void CC1Command::setEnvironment(llvm::ArrayRef<const char *> NewEnvironment) {
   // We don't support set a new environment when calling into ExecuteCC1Tool()
   llvm_unreachable(
       "The CC1Command doesn't support changing the environment vars!");
+}
+
+ThinLTOMergeCommand::ThinLTOMergeCommand(
+    const Action &Source, const Tool &Creator,
+    ResponseFileSupport ResponseSupport, const char *Executable,
+    const llvm::opt::ArgStringList &Arguments, ArrayRef<InputInfo> Inputs,
+    ArrayRef<InputInfo> Outputs, StringRef SplitOutputList,
+    bool CleanupSplitOutputs)
+    : Command(Source, Creator, ResponseSupport, Executable, Arguments, Inputs,
+              Outputs),
+      SplitOutputList(SplitOutputList),
+      CleanupSplitOutputs(CleanupSplitOutputs) {}
+
+void ThinLTOMergeCommand::cleanupSplitOutputs() const {
+  // Remove the partition objects listed in the response file. Per-partition
+  // .dwo files (split DWARF) are deliberately kept: they are final debug output
+  // referenced by the merged object's skeleton CUs.
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> MBOrErr =
+      llvm::MemoryBuffer::getFile(SplitOutputList, /*IsText=*/true,
+                                  /*RequiresNullTerminator=*/false);
+  if (!MBOrErr)
+    return;
+
+  llvm::BumpPtrAllocator Alloc;
+  llvm::StringSaver Saver(Alloc);
+  SmallVector<const char *, 16> OutputFiles;
+  llvm::cl::TokenizeGNUCommandLine((*MBOrErr)->getBuffer(), Saver, OutputFiles);
+  for (const char *OutputFile : OutputFiles)
+    llvm::sys::fs::remove(OutputFile);
+}
+
+int ThinLTOMergeCommand::Execute(ArrayRef<std::optional<StringRef>> Redirects,
+                                 std::string *ErrMsg,
+                                 bool *ExecutionFailed) const {
+  int Res = Command::Execute(Redirects, ErrMsg, ExecutionFailed);
+  // Clean up the partition inputs only on full success; keep them on any
+  // failure so the failing `ld.lld -r` can be re-run or inspected.
+  bool Launched = !ExecutionFailed || !*ExecutionFailed;
+  if (CleanupSplitOutputs && Launched && Res == 0)
+    cleanupSplitOutputs();
+  return Res;
 }
 
 void JobList::Print(raw_ostream &OS, const char *Terminator, bool Quote,

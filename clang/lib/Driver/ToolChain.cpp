@@ -777,6 +777,7 @@ Tool *ToolChain::getTool(Action::ActionClass AC) const {
   case Action::BinaryAnalyzeJobClass:
   case Action::BinaryTranslatorJobClass:
   case Action::ObjcopyJobClass:
+  case Action::ThinLTOMergeJobClass:
     llvm_unreachable("Invalid tool kind.");
 
   case Action::CompileJobClass:
@@ -1222,7 +1223,21 @@ Tool *ToolChain::SelectTool(const JobAction &JA) const {
   if (AC == Action::AssembleJobClass && useIntegratedAs() &&
       !getTriple().isOSAIX())
     return getClangAs();
+  // ThinLTOMergeJobAction is only generated for ELF targets (see
+  // Driver::BuildActions). Assert here to catch accidental routing to
+  // non-ELF toolchains that do not implement the merge logic.
+  if (AC == Action::ThinLTOMergeJobClass) {
+    assert(getTriple().isOSBinFormatELF() &&
+           "ThinLTOMergeJobAction should only be generated for ELF targets");
+    return getLink();
+  }
   return getTool(AC);
+}
+
+bool ToolChain::canConstructThinLTOMergeJob() const {
+  ActionList Inputs;
+  LinkJobAction JA(Inputs, types::TY_Image);
+  return SelectTool(JA)->canConstructThinLTOMergeJob();
 }
 
 std::string ToolChain::GetFilePath(const char *Name) const {

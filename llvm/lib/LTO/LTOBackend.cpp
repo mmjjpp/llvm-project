@@ -34,10 +34,8 @@
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/Program.h"
 #include "llvm/Support/ThreadPool.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/VirtualFileSystem.h"
@@ -49,6 +47,7 @@
 #include "llvm/Transforms/Utils/SplitModule.h"
 #include "llvm/Transforms/Utils/SplitModuleCG.h"
 #include <filesystem>
+#include <limits>
 #include <optional>
 
 using namespace llvm;
@@ -103,6 +102,41 @@ static cl::opt<bool> ThinLTOSplit("thinlto-split", cl::init(false),
 
 namespace llvm {
 extern cl::opt<bool> NoPGOWarnMismatch;
+}
+
+bool lto::isThinLTOSplitEnabled() { return ThinLTOSplit; }
+
+unsigned lto::getThinLTOSplitMaxPartitions() {
+  if (!ThinLTOSplit)
+    return 1;
+  // ThinLTOSplitPartitions==0 means "decide per module from the call graph",
+  // so there is no static upper bound the client can rely on.
+  return ThinLTOSplitPartitions;
+}
+
+static unsigned getThinLTOOutputTask(const Config &C, unsigned LogicalTask,
+                                     unsigned PartitionId) {
+  if (!C.UseExpandedThinLTOSplitTaskIds)
+    return C.AcceptsMultipleOutputsPerTask ? PartitionId : LogicalTask;
+
+  if (C.ThinLTOSplitTaskIdStride == 0)
+    report_fatal_error(
+        "ThinLTO split codegen expanded task ids require a non-zero stride.");
+  if (PartitionId >= C.ThinLTOSplitTaskIdStride)
+    report_fatal_error(
+        "ThinLTO split codegen produced more partitions than the task id "
+        "stride allows.");
+
+  uint64_t PhysicalTask =
+      uint64_t(LogicalTask) * C.ThinLTOSplitTaskIdStride + PartitionId;
+  if (PhysicalTask > std::numeric_limits<unsigned>::max())
+    report_fatal_error("ThinLTO split codegen task id overflow.");
+  return unsigned(PhysicalTask);
+}
+
+static unsigned getThinLTOSingleOutputTask(const Config &C,
+                                           unsigned LogicalTask) {
+  return getThinLTOOutputTask(C, LogicalTask, /*PartitionId=*/0);
 }
 
 [[noreturn]] static void reportOpenError(StringRef Path, Twine Msg) {
@@ -486,6 +520,17 @@ static void codegen(const Config &Conf, TargetMachine *TM,
     DwoFile = Conf.DwoDir;
     sys::path::append(DwoFile, std::to_string(Task) + ".dwo");
     TM->Options.MCOptions.SplitDwarfFile = std::string(DwoFile);
+  } else if (!Conf.SplitDwarfOutputStem.empty()) {
+    DwoFile = (Twine(Conf.SplitDwarfOutputStem) + ".thinlto-split." +
+               Twine(Task) + ".dwo").str();
+    // Ensure the parent directory exists (same directory as the .o output).
+    SmallString<128> DwoParent(sys::path::parent_path(DwoFile));
+    if (!DwoParent.empty()) {
+      if (auto EC = llvm::sys::fs::create_directories(DwoParent))
+        report_fatal_error(Twine("Failed to create directory ") + DwoParent +
+                           ": " + EC.message());
+    }
+    TM->Options.MCOptions.SplitDwarfFile = std::string(DwoFile);
   } else
     TM->Options.MCOptions.SplitDwarfFile = Conf.SplitDwarfFile;
 
@@ -567,40 +612,6 @@ static bool HasLargeCG(Module &Mod, const ModuleSummaryIndex &CombinedIndex) {
   return true;
 }
 
-struct TaskIdAllocator {
-  using TaskId = unsigned;
-
-  // Use the most significant bit (MSB) as a namespace tag.
-  // - Original ThinLTO backend tasks are expected to have MSB == 0.
-  // - Split partitions allocated by this allocator always have MSB == 1.
-  // This guarantees the two ID spaces never overlap.
-  static constexpr TaskId tag() {
-    return TaskId{1} << (std::numeric_limits<TaskId>::digits - 1);
-  }
-
-  // Monotonic sequence counter for split partitions (MSB must remain 0 here).
-  std::atomic<TaskId> seq{0};
-
-  // Allocate a globally unique TaskId for a split partition.
-  // The returned ID is `tag() | seq`, so it lives in the MSB==1 namespace.
-  TaskId alloc() {
-    TaskId v = seq.fetch_add(1, std::memory_order_relaxed);
-
-    // If the counter ever reaches the MSB, we'd overlap namespaces.
-    // This indicates an overflow / too many partitions.
-    if (v & tag())
-      report_fatal_error("Partition TaskId overflow: seq reached the tag bit.");
-
-    return tag() | v;
-  }
-
-  // Helper for sanity checks / debugging.
-  static bool isPartition(TaskId id) { return (id & tag()) != 0; }
-};
-
-// Global allocator shared by all split partitions.
-static TaskIdAllocator gSplitTaskIds;
-
 static bool splitOptAndCodeGenThin(unsigned task, const Config &C,
                                    TargetMachine *TM, AddStreamFn AddStream,
                                    unsigned ParallelCodeGenParallelismLevel,
@@ -614,37 +625,44 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C,
 
   static std::mutex PrintMutex;
 
-  SplitModuleCG SplitModuleCG(Mod, CombinedIndex, ParallelCodeGenParallelismLevel);
-  ParallelCodeGenParallelismLevel = SplitModuleCG.getPartitionNum();
+  // Clamp the splitter to the per-task stride budget that getMaxTasks() used to
+  // size the client's output table, so the partition count can never exceed it.
+  // Needed for the "auto" case (no -thinlto-split-partitions), where the
+  // splitter would otherwise pick one partition per call-graph root.
+  unsigned PartitionLimit = ParallelCodeGenParallelismLevel;
+  if (C.UseExpandedThinLTOSplitTaskIds && C.ThinLTOSplitTaskIdStride != 0 &&
+      (PartitionLimit == 0 || PartitionLimit > C.ThinLTOSplitTaskIdStride))
+    PartitionLimit = C.ThinLTOSplitTaskIdStride;
 
-  std::vector<std::string> TempObjectFiles(ParallelCodeGenParallelismLevel);
-  std::vector<llvm::FileRemover> TempFileRemovers(ParallelCodeGenParallelismLevel);
+  SplitModuleCG SplitModuleCG(Mod, CombinedIndex, PartitionLimit);
+  unsigned PartitionCount = SplitModuleCG.getPartitionNum();
+  if (!C.AcceptsMultipleOutputsPerTask && PartitionCount > 1)
+    report_fatal_error(
+        "The current LTO client does not support ThinLTO split codegen.");
+  if (C.UseExpandedThinLTOSplitTaskIds) {
+    if (C.ThinLTOSplitTaskIdStride == 0)
+      report_fatal_error(
+          "ThinLTO split codegen expanded task ids require a non-zero stride.");
+    if (PartitionCount > C.ThinLTOSplitTaskIdStride)
+      report_fatal_error(
+          "ThinLTO split codegen produced more partitions than the task id "
+          "stride allows.");
+  }
+  ParallelCodeGenParallelismLevel = PartitionCount;
 
   const auto HandleModulePartition = [&](std::unique_ptr<Module> MPart,
                                          unsigned PartitionId) {
-    unsigned CurrentThreadId, UniqueTaskId;
+    unsigned CurrentThreadId;
     {
       std::lock_guard<std::mutex> Lock(PrintMutex);
       CurrentThreadId = ThreadCount++;
-
-      // In distributed ThinLTO, `task` may be a sentinel (e.g. -1 cast to
-      // unsigned), which becomes UINT_MAX and naturally has MSB==1. Treat it
-      // as "no base task id" and don't enforce the namespace check on it.
-      //
-      // We do not rely on the incoming `task` for partition uniqueness: split
-      // partitions get a dedicated UniqueTaskId allocated below.
-      if (task != std::numeric_limits<unsigned>::max()) {
-        assert(!TaskIdAllocator::isPartition(task) &&
-               "Original ThinLTO TaskId unexpectedly overlaps the partition "
-               "namespace");
-      }
-      UniqueTaskId = gSplitTaskIds.alloc();
     }
 
+    unsigned PartitionTask = getThinLTOOutputTask(C, task, PartitionId);
     std::unique_ptr<TargetMachine> ThreadTM = createTargetMachine(C, T, *MPart);
 
     if (DoOpt) {
-      if (!opt(C, ThreadTM.get(), UniqueTaskId, *MPart, /*IsThinLTO=*/true,
+      if (!opt(C, ThreadTM.get(), PartitionTask, *MPart, /*IsThinLTO=*/true,
                /*ExportSummary=*/nullptr, /*ImportSummary=*/&CombinedIndex,
                CmdArgs, BitcodeLibFuncs)) {
         report_fatal_error("Failed to gen opt for split mod in thread.");
@@ -655,10 +673,10 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C,
       // running `opt()`. We're not reaching here as it's bailed out earlier
       // with `CodeGenOnly` which has been set in `SecondRoundThinBackend`.
       if (IRAddStream)
-        cgdata::saveModuleForTwoRounds(*MPart, task + CurrentThreadId,
+        cgdata::saveModuleForTwoRounds(*MPart, PartitionTask,
                                        IRAddStream);
     }
-    
+
     // Rename the GlobalValues whose internal is changed to external. That's
     // can avoid duplicate symbols.
     auto PromotedRenames = SplitModuleCG.getPromotedRenames();
@@ -669,88 +687,11 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C,
       }
     }
 
-    auto splitStream = [&](unsigned task, const Twine &moduleName)
-        -> Expected<std::unique_ptr<CachedFileStream>> {
-      int FD;
-      SmallString<128> TempFilename;
-      if (std::error_code EC = sys::fs::createTemporaryFile(
-              "thinlto-split", "o", FD, TempFilename))
-        return errorCodeToError(EC);
-
-      TempObjectFiles[PartitionId] = std::string(TempFilename.str());
-      TempFileRemovers[PartitionId].setFile(TempObjectFiles[PartitionId]);
-
-      auto OS = std::make_unique<raw_fd_ostream>(
-          FD, true, /*CloseOnDestruct*/true);
-
-      auto Stream = std::make_unique<CachedFileStream>(
-          std::move(OS), std::string(TempFilename.str()));
-
-      return std::move(Stream);
-    };
-
-    codegen(C, ThreadTM.get(), splitStream, UniqueTaskId, *MPart,
-            CombinedIndex);
+    codegen(C, ThreadTM.get(), AddStream, PartitionTask, *MPart, CombinedIndex);
   };
 
   SplitModuleCG.SplitModule(HandleModulePartition, C);
 
-  // Use ld.lld to combine the partitions into a object.
-  if (TempObjectFiles.empty()) {
-    llvm::errs() << "TempObjectFiles.empty()\n";
-    return true;
-  }
-
-  auto FinalStream = AddStream(task, Mod.getModuleIdentifier());
-  if (!FinalStream)
-    report_fatal_error("Failed to open final output stream");
-
-  SmallString<128> MergedFilename;
-  if (sys::fs::createTemporaryFile("thinlto-merged", "o", MergedFilename))
-    report_fatal_error("Failed to create merged temp file.");
-  llvm::FileRemover MergedFileRemover(MergedFilename);
-
-  std::vector<StringRef> Args;
-  std::string LinkerPath = "";
-  if (auto Path = sys::findProgramByName("ld.lld"))
-    LinkerPath = *Path;
-  else if (auto Path = sys::findProgramByName("ld"))
-    LinkerPath = *Path;
-
-  if (LinkerPath.empty())
-    report_fatal_error("Cannot find linkeer (ld or ld.lld) to merge partitions.");
-
-  Args.push_back(LinkerPath);
-  Args.push_back("-r");
-  Args.push_back("-o");
-  Args.push_back(MergedFilename);
-
-  for (const auto &File : TempObjectFiles)
-    Args.push_back(File);
-
-  std::string ErrMsg;
-  int Result = sys::ExecuteAndWait(LinkerPath, Args, /*Env=*/std::nullopt,
-                                   /*Redirects=*/{}, /*SecondsToWait=*/0,
-                                   /*MemoryLimit=*/0, &ErrMsg);
-
-  if (Result != 0) {
-    errs() << "Linker failed: " << ErrMsg << "\n";
-    report_fatal_error("Failed to merge split objects.");
-  }
-
-  {
-    std::unique_ptr<CachedFileStream> &FinalFileStream = *FinalStream;
-    auto BufferOrErr = MemoryBuffer::getFile(MergedFilename);
-    if (!BufferOrErr)
-      report_fatal_error("Failed to read merged object.");
-
-    FinalFileStream->OS->write(BufferOrErr.get()->getBufferStart(),
-                               BufferOrErr.get()->getBufferSize());
-    if (Error Err = FinalFileStream->commit()) {
-      report_fatal_error(Twine("Failed to commit final file stream: ") +
-                         toString(std::move(Err)));
-    }
-  }
   return true;
 }
 
@@ -939,7 +880,8 @@ Error lto::thinBackend(const Config &Conf, unsigned Task, AddStreamFn AddStream,
     else
       // If CodeGenOnly is set, we only perform code generation and skip
       // optimization. This value may differ from Conf.CodeGenOnly.
-      codegen(Conf, TM.get(), AddStream, Task, Mod, CombinedIndex);
+      codegen(Conf, TM.get(), AddStream, getThinLTOSingleOutputTask(Conf, Task),
+              Mod, CombinedIndex);
     return finalizeOptimizationRemarks(std::move(DiagnosticOutputFile));
   }
 
@@ -968,7 +910,8 @@ Error lto::thinBackend(const Config &Conf, unsigned Task, AddStreamFn AddStream,
           if (IRAddStream)
             cgdata::saveModuleForTwoRounds(Mod, Task, IRAddStream);
 
-          codegen(Conf, TM, AddStream, Task, Mod, CombinedIndex);
+          codegen(Conf, TM, AddStream, getThinLTOSingleOutputTask(Conf, Task),
+                  Mod, CombinedIndex);
         }
         return finalizeOptimizationRemarks(std::move(DiagnosticOutputFile));
       };

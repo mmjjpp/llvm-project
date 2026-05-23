@@ -5399,6 +5399,17 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     if (!types::isLLVMIR(Input.getType()))
       D.Diag(diag::err_drv_arg_requires_bitcode_input) << A->getAsString(Args);
     Args.AddLastArg(CmdArgs, options::OPT_fthinlto_index_EQ);
+
+    // For ThinLTO split codegen, have cc1 write each call-graph partition to a
+    // separate object listed in a response file; the driver's
+    // ThinLTOMergeJobAction merges them with `ld.lld -r`. Gate on the default
+    // toolchain (as Driver::BuildActions does) so this flag and the merge action
+    // stay in lockstep. See isThinLTOSplitMergeEnabled.
+    if (Output.isFilename() && Output.getType() == types::TY_Object &&
+        isThinLTOSplitMergeEnabled(C.getDefaultToolChain(), Args))
+      CmdArgs.push_back(Args.MakeArgString(
+          Twine("-thinlto-split-output-list=") +
+          getThinLTOSplitResponseFile(Output.getFilename())));
   }
 
   if (Triple.isPPC())
