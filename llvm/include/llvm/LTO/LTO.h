@@ -611,6 +611,11 @@ private:
 
   Error checkPartiallySplit();
 
+  /// ThinLTO split task-id stride (see Config::ThinLTOSplitTaskIdStride);
+  /// cached so getMaxTasks() and runThinLTO() agree. Returns 1 when off.
+  unsigned getThinLTOSplitTaskIdStride() const;
+  mutable std::optional<unsigned> ThinLTOSplitTaskIdStrideCache;
+
   mutable bool CalledGetMaxTasks = false;
 
 protected:

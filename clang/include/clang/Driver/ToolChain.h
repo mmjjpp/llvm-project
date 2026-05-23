@@ -432,6 +432,8 @@ public:
   /// a compiler other than Clang.
   virtual Tool *SelectTool(const JobAction &JA) const;
 
+  bool canConstructThinLTOMergeJob() const;
+
   // Helper methods
 
   std::string GetFilePath(const char *Name) const;

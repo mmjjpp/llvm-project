@@ -62,6 +62,7 @@
 #include "llvm/Transforms/Utils/FunctionImportUtils.h"
 #include "llvm/Transforms/Utils/SplitModule.h"
 
+#include <limits>
 #include <optional>
 #include <set>
 
@@ -107,6 +108,14 @@ void LTO::emitRemark(OptimizationRemark &Remark) {
 static cl::opt<bool>
     DumpThinCGSCCs("dump-thin-cg-sccs", cl::init(false), cl::Hidden,
                    cl::desc("Dump the SCCs in the ThinLTO index's callgraph"));
+
+/// Caps the auto-selected ThinLTO split partitions per module (when
+/// -thinlto-split-partitions is 0), bounding the task-id stride and the
+/// client's getMaxTasks()-sized output table.
+static cl::opt<unsigned> MaxAutoThinLTOSplitPartitions(
+    "max-auto-thinlto-split-partitions", cl::init(32), cl::Hidden,
+    cl::desc("Cap on auto-selected ThinLTO split partitions per module"));
+
 namespace llvm {
 extern cl::opt<bool> CodeGenDataThinLTOTwoRounds;
 extern cl::opt<bool> ForceImportAll;
@@ -1247,11 +1256,51 @@ LTO::addThinLTO(BitcodeModule BM, ArrayRef<InputFile::Symbol> Syms,
   return Res;
 }
 
+unsigned LTO::getThinLTOSplitTaskIdStride() const {
+  if (!Conf.UseExpandedThinLTOSplitTaskIds)
+    return 1;
+  if (ThinLTOSplitTaskIdStrideCache)
+    return *ThinLTOSplitTaskIdStrideCache;
+
+  // The stride is a hard per-task budget: splitOptAndCodeGenThin clamps the
+  // splitter to it, so the partition count can never exceed it and the task-id
+  // layout T*Stride+p stays collision-free. Prefer the configured value so
+  // getMaxTasks() (called before run()) and runThinLTO() agree on the stride.
+  unsigned Stride = getThinLTOSplitMaxPartitions();
+  if (Stride == 0) {
+    // No explicit count: size from the largest module's defined-symbol count,
+    // capped so a huge module cannot blow up the task-id space.
+    DenseMap<StringRef, GVSummaryMapTy> ModuleToDefinedGVSummaries(
+        ThinLTO.ModuleMap.size());
+    ThinLTO.CombinedIndex.collectDefinedGVSummariesPerModule(
+        ModuleToDefinedGVSummaries);
+    Stride = 1;
+    for (const auto &Mod : ModuleToDefinedGVSummaries)
+      Stride = std::max<unsigned>(Stride, Mod.second.size());
+    Stride = std::min<unsigned>(Stride, MaxAutoThinLTOSplitPartitions);
+  }
+  ThinLTOSplitTaskIdStrideCache = Stride;
+  return Stride;
+}
+
 unsigned LTO::getMaxTasks() const {
   CalledGetMaxTasks = true;
-  auto ModuleCount = ThinLTO.ModulesToCompile ? ThinLTO.ModulesToCompile->size()
-                                              : ThinLTO.ModuleMap.size();
-  return RegularLTO.ParallelCodeGenParallelismLevel + ModuleCount;
+  uint64_t ModuleCount = ThinLTO.ModulesToCompile
+                             ? ThinLTO.ModulesToCompile->size()
+                             : ThinLTO.ModuleMap.size();
+  // Split codegen reports partition `p` of task `T` as id `T*Stride+p`, whose
+  // max is `(Parallel+ModuleCount)*Stride - 1`; size the table for that. With
+  // Stride == 1 (no expansion) this is the usual `Parallel + ModuleCount`.
+  uint64_t Stride = getThinLTOSplitTaskIdStride();
+  uint64_t MaxTasks =
+      (uint64_t(RegularLTO.ParallelCodeGenParallelismLevel) + ModuleCount) *
+      Stride;
+  // Refuse to truncate the unsigned task id (would under-size the client table
+  // and let a later partition write out of bounds).
+  if (MaxTasks > std::numeric_limits<unsigned>::max())
+    report_fatal_error("ThinLTO split codegen task id space overflow; reduce "
+                       "-thinlto-split-partitions or the number of inputs.");
+  return unsigned(MaxTasks);
 }
 
 // If only some of the modules were split, we cannot correctly handle
@@ -1643,9 +1692,12 @@ public:
 
     if (!Cache.isValid() || !CombinedIndex.modulePaths().count(ModuleID) ||
         all_of(CombinedIndex.getModuleHash(ModuleID),
-               [](uint32_t V) { return V == 0; }))
+               [](uint32_t V) { return V == 0; }) ||
+        Conf.AcceptsMultipleOutputsPerTask)
       // Cache disabled or no entry for this module in the combined index or
-      // no module hash.
+      // no module hash. Also bypass when a task may emit several objects
+      // (ThinLTO split): the cache stores exactly one object per task, so split
+      // partitions would collide on one entry; run uncached instead.
       return RunThinBackend(AddStream);
 
     // The module may be cached, this helps handling it.
@@ -1763,9 +1815,12 @@ public:
            "Both caches for CG and IR should have matching availability");
     if (!CGCache.isValid() || !CombinedIndex.modulePaths().count(ModuleID) ||
         all_of(CombinedIndex.getModuleHash(ModuleID),
-               [](uint32_t V) { return V == 0; }))
+               [](uint32_t V) { return V == 0; }) ||
+        Conf.AcceptsMultipleOutputsPerTask)
       // Cache disabled or no entry for this module in the combined index or
-      // no module hash.
+      // no module hash. Also bypass the cache for ThinLTO split codegen (one
+      // logical task may emit multiple partition objects; see the comment in
+      // InProcessThinBackend::runThinLTOBackendThread).
       return RunThinBackend(CGAddStream, IRAddStream);
 
     // Get CGKey for caching object in CGCache.
@@ -1849,9 +1904,12 @@ public:
     };
     if (!Cache.isValid() || !CombinedIndex.modulePaths().count(ModuleID) ||
         all_of(CombinedIndex.getModuleHash(ModuleID),
-               [](uint32_t V) { return V == 0; }))
+               [](uint32_t V) { return V == 0; }) ||
+        Conf.AcceptsMultipleOutputsPerTask)
       // Cache disabled or no entry for this module in the combined index or
-      // no module hash.
+      // no module hash. Also bypass the cache for ThinLTO split codegen (one
+      // logical task may emit multiple partition objects; see the comment in
+      // InProcessThinBackend::runThinLTOBackendThread).
       return RunThinBackend(AddStream);
 
     // Get Key for caching the final object file in Cache with the combined
@@ -2075,6 +2133,11 @@ Error LTO::runThinLTO(AddStreamFn AddStream, FileCache Cache,
   for (auto &Mod : ThinLTO.ModuleMap)
     if (!ModuleToDefinedGVSummaries.count(Mod.first))
       ModuleToDefinedGVSummaries.try_emplace(Mod.first);
+
+  // Lock in the (cached) stride from getMaxTasks() so the client's output table
+  // and the task ids the backends produce stay consistent.
+  if (Conf.UseExpandedThinLTOSplitTaskIds && Conf.ThinLTOSplitTaskIdStride == 0)
+    Conf.ThinLTOSplitTaskIdStride = getThinLTOSplitTaskIdStride();
 
   FunctionImporter::ImportListsTy ImportLists(ThinLTO.ModuleMap.size());
   DenseMap<StringRef, FunctionImporter::ExportSetTy> ExportLists(

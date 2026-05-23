@@ -22,6 +22,7 @@
 #include "llvm/DTLTO/DTLTO.h"
 #include "llvm/LTO/Config.h"
 #include "llvm/LTO/LTO.h"
+#include "llvm/LTO/LTOBackend.h"
 #include "llvm/Support/Caching.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -173,6 +174,17 @@ static lto::Config createConfig(Ctx &ctx) {
     checkError(ctx.e, c.addSaveTemps(ctx.arg.outputFile.str() + ".",
                                      /*UseInputModulePath*/ true,
                                      ctx.arg.saveTempsArgs));
+
+  // With ThinLTO split codegen the in-process backend emits one object per
+  // call-graph partition, which lld consumes directly. Opt in to multiple
+  // outputs per task and the expanded task-id layout (T*Stride+p) so partitions
+  // from different modules occupy distinct slots. Index-only and DTLTO do not
+  // run codegen in lld, so they keep the defaults.
+  if (lto::isThinLTOSplitEnabled() && !ctx.arg.thinLTOIndexOnly &&
+      ctx.arg.dtltoDistributor.empty()) {
+    c.AcceptsMultipleOutputsPerTask = true;
+    c.UseExpandedThinLTOSplitTaskIds = true;
+  }
   return c;
 }
 
@@ -379,8 +391,12 @@ SmallVector<std::unique_ptr<InputFile>, 0> BitcodeCompiler::compile() {
 
   if (!ctx.arg.ltoObjPath.empty()) {
     saveBuffer(buf[0].second, ctx.arg.ltoObjPath);
+    // With ThinLTO split codegen the task-id space is sparse (only a few of the
+    // Stride slots per module are used), so skip empty slots instead of writing
+    // a zero-length file for every gap.
     for (unsigned i = 1; i != maxTasks; ++i)
-      saveBuffer(buf[i].second, ctx.arg.ltoObjPath + Twine(i));
+      if (!buf[i].second.empty())
+        saveBuffer(buf[i].second, ctx.arg.ltoObjPath + Twine(i));
   }
 
   bool savePrelink = ctx.arg.saveTempsArgs.contains("prelink");

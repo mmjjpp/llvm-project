@@ -14,19 +14,18 @@
 ;    named by llvm.global_ctors
 ; 2. the final ELF keeps all 7 init-array entries
 ;
+; This exercises the in-process (link-time) ThinLTO split path: lld runs the
+; ThinLTO backend, the module is split into partitions, and lld consumes every
+; partition object directly into the link.
+;
 ; RUN: opt --thinlto-bc --thinlto-split-lto-unit -o %t.o %s
 ; RUN: ld.lld %t.o -shared -o %t.so -save-temps \
 ; RUN:   -mllvm -thinlto-split=true \
 ; RUN:   -mllvm -thinlto-split-partitions=2 \
 ; RUN:   -mllvm -thinlto-split-module-size-threshold=0 \
-; RUN:   -mllvm -thinlto-split-threshold=0 \
-; RUN:   -mllvm -thinlto-split-module-size-rate-threshold=2.0 \
-; RUN:   -mllvm -parallel-cloneModule=false
-; RUN: for f in %t.so.*.5.precodegen.bc; do \
-; RUN:   if llvm-dis -o - "$f" | grep -q '@llvm.global_ctors'; then \
-; RUN:     llvm-dis -o - "$f"; \
-; RUN:   fi; \
-; RUN: done | FileCheck %s --check-prefix=OWNER
+; RUN:   -mllvm -thinlto-split-module-size-rate-threshold=2.0
+; RUN: llvm-dis %t.so.*.5.precodegen.bc
+; RUN: cat %t.so.*.5.precodegen.ll | FileCheck %s --check-prefix=OWNER
 ; RUN: llvm-readelf -SW %t.so | FileCheck %s --check-prefix=FINAL
 
 ; OWNER: @llvm.global_ctors = appending global [7 x { i32, ptr, ptr }]

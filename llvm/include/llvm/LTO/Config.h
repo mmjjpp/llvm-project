@@ -105,6 +105,20 @@ struct Config {
   /// distinguished.
   mutable bool Dtlto = 0;
 
+  /// True if the client can receive multiple native objects per logical
+  /// ThinLTO task (required to consume ThinLTO split codegen; sized via
+  /// LTO::getMaxTasks()). Clients that leave it false hard-error on a split.
+  bool AcceptsMultipleOutputsPerTask = false;
+
+  /// Report ThinLTO split partition `p` of task `T` as id
+  /// `T * ThinLTOSplitTaskIdStride + p` (disjoint ranges per module). Set by
+  /// in-process clients like lld; the distributed backend leaves it false.
+  bool UseExpandedThinLTOSplitTaskIds = false;
+
+  /// Max partition objects per task under UseExpandedThinLTOSplitTaskIds. Zero
+  /// lets LTO::getMaxTasks() pick a value; must be non-zero once backends run.
+  unsigned ThinLTOSplitTaskIdStride = 0;
+
   /// Allows non-imported definitions to get the potentially more constraining
   /// visibility from the prevailing definition. FromPrevailing is the default
   /// because it works for many binary formats. ELF can use the more optimized
@@ -151,6 +165,9 @@ struct Config {
   /// running an individual backend directly via thinBackend(), as otherwise
   /// all .dwo files will be written to the same path. Not used in skeleton CU.
   std::string SplitDwarfOutput;
+
+  /// Stem for per-partition ThinLTO split .dwo files.
+  std::string SplitDwarfOutputStem;
 
   /// Optimization remarks file path.
   std::string RemarksFilename;

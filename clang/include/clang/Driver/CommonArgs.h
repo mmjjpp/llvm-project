@@ -158,6 +158,19 @@ bool isObjCAutoRefCount(const llvm::opt::ArgList &Args);
 llvm::StringRef getLTOParallelism(const llvm::opt::ArgList &Args,
                                   const Driver &D);
 
+bool isThinLTOSplitEnabled(const llvm::opt::ArgList &Args);
+
+/// Response-file path listing the partition objects for cc1 output \p Output.
+/// Written by cc1 (-thinlto-split-output-list) and read by ThinLTOMergeJobAction
+/// (`ld.lld -r @<file>`); shared so both agree on the name.
+std::string getThinLTOSplitResponseFile(llvm::StringRef Output);
+
+/// Single gating predicate (shared by the cc1 flag and the merge action) for
+/// whether the driver splits a distributed ThinLTO compile and merges it with
+/// `ld.lld -r`.
+bool isThinLTOSplitMergeEnabled(const ToolChain &TC,
+                                const llvm::opt::ArgList &Args);
+
 bool areOptimizationsEnabled(const llvm::opt::ArgList &Args);
 
 bool isUseSeparateSections(const llvm::Triple &Triple);
