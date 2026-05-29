@@ -68,6 +68,9 @@ AGENTS.md
 .cursor
 .cursorignore
 .cursorindexingignore
+/trunk_thinlto_split
+/trunk_clang23
+.antigravitycli
 
 #==============================================================================#
 # Directories to ignore (do not add trailing '/'s, they skip symlinks).
