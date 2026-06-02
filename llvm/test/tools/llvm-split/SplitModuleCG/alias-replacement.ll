@@ -14,13 +14,13 @@
 @abar = dso_local alias void (), ptr @bar
 
 ; CHECK0-DAG: define dso_local void @bar()
-; CHECK0-DAG: declare void @call_abar()
+; CHECK0-DAG: declare !guid !{{[0-9]+}} void @call_abar()
 ; CHECK0-DAG: define void @call_afoo()
 ; CHECK0-Next: call void @foo()
 ; CHECK1-DAG: define available_externally dso_local void @bar()
 ; CHECK1-DAG: define void @call_abar()
 ; CHECK1-Next: call void @bar()
-; CHECK1-DAG: declare void @call_afoo()
+; CHECK1-DAG: declare !guid !{{[0-9]+}} void @call_afoo()
 
 define dso_local void @bar() {
 entry:
