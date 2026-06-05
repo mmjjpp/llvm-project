@@ -9,6 +9,7 @@
 #include "llvm/IR/Value.h"
 #include "llvm/Support/MD5.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+
 #include <mutex>
 #include <thread>
 
@@ -31,6 +32,10 @@ static cl::opt<bool> ParallelCloneModule(
 static cl::opt<bool>
    SerialParseModule("serial-parse-module", cl::Hidden, cl::init(false),
               cl::desc("serial parse module"));
+
+static cl::opt<bool>
+    LazyParseModule("lazy-parse-module", cl::Hidden, cl::init(false),
+               cl::desc("lazy parse module"));
 
 using PartitionID = unsigned;
 
@@ -427,7 +432,7 @@ bool SplitModuleCG::isInitArrayAnchorMember(const GlobalValue *GV) const {
 }
 
 void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I,
-                                  function_ref<bool(const GlobalValue *)> NeedsConservativeImport) {
+             function_ref<bool(const GlobalValue *)> NeedsConservativeImport) {
   dealWithDuplicateDebugInfo(MPart);
   dealWithDeclareDebugInfo(MPart);
   // collect symbols to rename
@@ -628,7 +633,7 @@ void SplitModuleCG::SplitModule(ModuleCreationCallback ModuleCallback,
   auto GVPartitions = doGValuePartitioning(GVRecord, Partitions, N);
 
   // local GVs need to be conservatively imported into [dependency] every module,
- 	// and then cleaned up afterwards.
+  // and then cleaned up afterwards.
   const auto NeedsConservativeImport = [&](const GlobalValue *GV) {
     // We conservatively import private/internal GVs into every module and clean
     // them up afterwards.
@@ -673,7 +678,92 @@ void SplitModuleCG::SplitModule(ModuleCreationCallback ModuleCallback,
 
   std::vector<std::thread> Threads;
   Threads.reserve(N);
-  if (ParallelCloneModule) {
+
+  LLVM_DEBUG(dbgs() << "Start to clone module.\n");
+  if (LazyParseModule) {
+    SmallString<0> BC;
+    raw_svector_ostream BCOS(BC);
+    WriteBitcodeToFile(M, BCOS);
+
+    for (unsigned I = 0; I < N; ++I) {
+      Threads.emplace_back([&, I]() {
+        std::unique_ptr<Module> MPart;
+        llvm::lto::LTOLLVMContext Ctx(C);
+        {
+          Expected<std::unique_ptr<Module>> MOrErr = getLazyBitcodeModule(MemoryBufferRef(BC.str(), "ld-temp.o"), Ctx);
+          if (!MOrErr)
+            report_fatal_error("Failed to read bitcode");
+          MPart = std::move(MOrErr.get());
+          for (auto &F : MPart->functions()) {
+            if (!F.isDeclaration() && !ShouldCloneDefinition(I, &F)) {
+              F.deleteBody();
+              F.setLinkage(GlobalValue::ExternalLinkage);
+              F.setComdat(nullptr);
+              F.setSubprogram(nullptr);
+              F.setPersonalityFn(nullptr);
+            }
+          }
+          for (auto &GV : MPart->globals()) {
+            if (!GV.isDeclaration() && !ShouldCloneDefinition(I, &GV)) {
+              GV.setInitializer(nullptr);
+              GV.setLinkage(GlobalValue::ExternalLinkage);
+              GV.setComdat(nullptr);
+            }
+          }
+          for (auto &GV : llvm::make_early_inc_range(MPart->aliases())) {
+            if (!GV.isDeclaration() && !ShouldCloneDefinition(I, &GV)) {
+              GlobalValue *Replacement;
+              auto GVName = GV.getName();
+              if (GV.getValueType()->isFunctionTy()) {
+                Replacement = Function::Create(
+                    cast<FunctionType>(GV.getValueType()),
+                    GlobalValue::ExternalLinkage,
+                    GV.getAddressSpace(),
+                    GV.getName(), MPart.get());
+              } else {
+                Replacement = new GlobalVariable(
+                    *MPart,
+                    GV.getValueType(),
+                    false,
+                    GlobalValue::ExternalLinkage,
+                    nullptr,
+                    GV.getName(),
+                    nullptr,
+                    GV.getThreadLocalMode(),
+                    GV.getType()->getAddressSpace());
+              }
+
+              GV.replaceAllUsesWith(Replacement);
+              GV.eraseFromParent();
+              Replacement->setName(GVName);
+            }
+          }
+          for (auto &GV : llvm::make_early_inc_range(MPart->ifuncs())) {
+            if (!GV.isDeclaration() && !ShouldCloneDefinition(I, &GV)) {
+              GlobalValue *Replacement;
+              auto GVName = GV.getName();
+              Replacement = Function::Create(
+                  cast<FunctionType>(GV.getValueType()),
+                  GlobalValue::ExternalLinkage,
+                  GV.getAddressSpace(),
+                  GV.getName(), MPart.get());
+
+              GV.replaceAllUsesWith(Replacement);
+              GV.eraseFromParent();
+              Replacement->setName(GVName);
+            }
+          }
+          cantFail(MPart->materializeAll());
+        }
+        dealWithMpart(*MPart, I, NeedsConservativeImport);
+        ModuleCallback(std::move(MPart), I);
+      });
+    }
+    for (auto &T : Threads) {
+      T.join();
+    }
+  }
+  else if (ParallelCloneModule) {
     // We want to clone the whole module into a new context to multi-thread
     // the cloneModule. We do it by serializing the whole module to bitcode
     // (while still on the main thread, in order to avoid data races) and
