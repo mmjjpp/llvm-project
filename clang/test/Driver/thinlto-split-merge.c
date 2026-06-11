@@ -1,31 +1,31 @@
 // RUN: %clang -### -target aarch64-unknown-linux-gnu -B%S/Inputs/lld \
 // RUN:   -c -fthinlto-index=foo.thinlto.bc -x ir %s -o foo.o \
-// RUN:   -mllvm -thinlto-split=true \
+// RUN:   -mllvm -lto-split-by-callgraph=true \
 // RUN:   -mllvm -thinlto-split-partitions=2 2>&1 | FileCheck %s --check-prefix=MERGE
 // RUN: %clang -### -target aarch64-unknown-linux-gnu -B%S/Inputs/lld \
 // RUN:   -c -fthinlto-index=foo.thinlto.bc -x ir %s -o foo.o \
-// RUN:   -mllvm -thinlto-split=true 2>&1 | FileCheck %s --check-prefix=LLD
+// RUN:   -mllvm -lto-split-by-callgraph=true 2>&1 | FileCheck %s --check-prefix=LLD
 // RUN: %clang -### -target aarch64-unknown-linux-gnu -B%S/Inputs/lld \
 // RUN:   -c -fthinlto-index=foo.thinlto.bc -x ir %s -o foo.o \
-// RUN:   -mllvm -thinlto-split=false 2>&1 | FileCheck %s --check-prefix=NOSPLIT
+// RUN:   -mllvm -lto-split-by-callgraph=false 2>&1 | FileCheck %s --check-prefix=NOSPLIT
 // RUN: %clang -### -target aarch64-unknown-linux-gnu -B%S/Inputs/lld \
 // RUN:   -save-temps -c -fthinlto-index=foo.thinlto.bc -x ir %s -o foo.o \
-// RUN:   -mllvm -thinlto-split=true 2>&1 | FileCheck %s --check-prefix=SAVE-TEMPS
+// RUN:   -mllvm -lto-split-by-callgraph=true 2>&1 | FileCheck %s --check-prefix=SAVE-TEMPS
 // RUN: rm -rf %t.empty
 // RUN: mkdir -p %t.empty
 // RUN: not env PATH= %clang -### -ccc-install-dir %t.empty \
 // RUN:   -target aarch64-unknown-linux-gnu \
 // RUN:   -c -fthinlto-index=foo.thinlto.bc -x ir %s -o foo.o \
-// RUN:   -mllvm -thinlto-split=true 2>&1 | FileCheck %s --check-prefix=MISSING-LLD
+// RUN:   -mllvm -lto-split-by-callgraph=true 2>&1 | FileCheck %s --check-prefix=MISSING-LLD
 // RUN: %clang -### -target x86_64-unknown-freebsd \
 // RUN:   -c -fthinlto-index=foo.thinlto.bc -x ir %s -o foo.o \
-// RUN:   -mllvm -thinlto-split=true 2>&1 | FileCheck %s --check-prefix=FREEBSD
+// RUN:   -mllvm -lto-split-by-callgraph=true 2>&1 | FileCheck %s --check-prefix=FREEBSD
 // RUN: %clang -### -target x86_64-unknown-fuchsia \
 // RUN:   -c -fthinlto-index=foo.thinlto.bc -x ir %s -o foo.o \
-// RUN:   -mllvm -thinlto-split=true 2>&1 | FileCheck %s --check-prefix=FUCHSIA
+// RUN:   -mllvm -lto-split-by-callgraph=true 2>&1 | FileCheck %s --check-prefix=FUCHSIA
 // RUN: %clang -### -target x86_64-none-elf \
 // RUN:   -c -fthinlto-index=foo.thinlto.bc -x ir %s -o foo.o \
-// RUN:   -mllvm -thinlto-split=true 2>&1 | FileCheck %s --check-prefix=BAREMETAL
+// RUN:   -mllvm -lto-split-by-callgraph=true 2>&1 | FileCheck %s --check-prefix=BAREMETAL
 
 // MERGE: "-cc1"
 // MERGE-SAME: "-fthinlto-index=foo.thinlto.bc"

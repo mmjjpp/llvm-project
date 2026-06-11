@@ -9,7 +9,7 @@
 ; RUN: %clang_cc1 -triple aarch64-unknown-linux-gnu \
 ; RUN:   -emit-obj -fthinlto-index=%t.o.thinlto.bc \
 ; RUN:   -o %t.split.o -x ir %t.o \
-; RUN:   -mllvm -thinlto-split=true \
+; RUN:   -mllvm -lto-split-by-callgraph=true \
 ; RUN:   -mllvm -thinlto-split-partitions=2 \
 ; RUN:   -mllvm -thinlto-split-module-size-threshold=0 \
 ; RUN:   -mllvm -thinlto-split-module-size-rate-threshold=2.0 \
@@ -21,7 +21,7 @@
 ; RUN: %clang_cc1 -triple aarch64-unknown-linux-gnu \
 ; RUN:   -emit-obj -fthinlto-index=%t.o.thinlto.bc \
 ; RUN:   -o %t.skip.o -x ir %t.o \
-; RUN:   -mllvm -thinlto-split=true \
+; RUN:   -mllvm -lto-split-by-callgraph=true \
 ; RUN:   -mllvm -thinlto-split-partitions=2 \
 ; RUN:   -thinlto-split-output-list=%t.skip.rsp
 ; RUN: FileCheck %s --check-prefix=SKIP-RSP --input-file=%t.skip.rsp

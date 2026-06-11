@@ -33,7 +33,7 @@
 ; RUN:   -emit-obj -fthinlto-index=%t.o.thinlto.bc \
 ; RUN:   -thinlto-split-output-list=%t.cc1.rsp \
 ; RUN:   -o %t.cc1.o -x ir %t.o \
-; RUN:   -mllvm -thinlto-split=true \
+; RUN:   -mllvm -lto-split-by-callgraph=true \
 ; RUN:   -mllvm -thinlto-split-partitions=2 \
 ; RUN:   -mllvm -thinlto-split-module-size-threshold=0 \
 ; RUN:   -mllvm -thinlto-split-module-size-rate-threshold=2.0
@@ -76,7 +76,7 @@
 ; RUN: %clang -### -target aarch64-unknown-linux-gnu \
 ; RUN:   -B%S/Inputs/lld \
 ; RUN:   -c -fthinlto-index=%t.o.thinlto.bc -x ir %t.o -o %t.driver.o \
-; RUN:   -mllvm -thinlto-split=true \
+; RUN:   -mllvm -lto-split-by-callgraph=true \
 ; RUN:   -mllvm -thinlto-split-partitions=2 \
 ; RUN:   -mllvm -thinlto-split-module-size-threshold=0 \
 ; RUN:   -mllvm -thinlto-split-module-size-rate-threshold=2.0 2>&1 | FileCheck %s --check-prefix=DRIVER
@@ -90,7 +90,7 @@
 ; RUN: %clang -### -target aarch64-unknown-linux-gnu \
 ; RUN:   -B%S/Inputs/lld \
 ; RUN:   -c -fthinlto-index=%t.o.thinlto.bc -x ir %t.o -o %t.nosplit_driver.o \
-; RUN:   -mllvm -thinlto-split=false 2>&1 | FileCheck %s --check-prefix=NOSPLIT-DRIVER
+; RUN:   -mllvm -lto-split-by-callgraph=false 2>&1 | FileCheck %s --check-prefix=NOSPLIT-DRIVER
 
 ; NOSPLIT-DRIVER: "-cc1"
 ; NOSPLIT-DRIVER-NOT: thinlto-split-output-list
@@ -104,7 +104,7 @@
 ; RUN: %clang -### -target aarch64-unknown-linux-gnu \
 ; RUN:   -B%S/Inputs/lld \
 ; RUN:   -save-temps -c -fthinlto-index=%t.o.thinlto.bc -x ir %t.o -o %t.save.o \
-; RUN:   -mllvm -thinlto-split=true \
+; RUN:   -mllvm -lto-split-by-callgraph=true \
 ; RUN:   -mllvm -thinlto-split-partitions=2 \
 ; RUN:   -mllvm -thinlto-split-module-size-threshold=0 \
 ; RUN:   -mllvm -thinlto-split-module-size-rate-threshold=2.0 2>&1 | FileCheck %s --check-prefix=SAVE-TEMPS
@@ -118,7 +118,7 @@
 ; Verify ordinary -save-temps without split still uses -S (not collapsed)
 ; RUN: %clang -### -target aarch64-unknown-linux-gnu \
 ; RUN:   -save-temps -c -fthinlto-index=%t.o.thinlto.bc -x ir %t.o -o %t.save_nosplit.o \
-; RUN:   -mllvm -thinlto-split=false 2>&1 | FileCheck %s --check-prefix=SAVE-TEMPS-NOSPLIT
+; RUN:   -mllvm -lto-split-by-callgraph=false 2>&1 | FileCheck %s --check-prefix=SAVE-TEMPS-NOSPLIT
 
 ; SAVE-TEMPS-NOSPLIT: "-cc1"
 ; SAVE-TEMPS-NOSPLIT-SAME: "-S"

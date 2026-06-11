@@ -946,9 +946,9 @@ bool tools::isThinLTOSplitEnabled(const ArgList &Args) {
   for (const Arg *A : Args.filtered(options::OPT_mllvm)) {
     for (size_t I = 0, E = A->getNumValues(); I != E; ++I) {
       StringRef V = A->getValue(I);
-      if (V == "-thinlto-split" || V == "-thinlto-split=true")
+      if (V == "-lto-split-by-callgraph" || V == "-lto-split-by-callgraph=true")
         Enabled = true;
-      else if (V == "-thinlto-split=false")
+      else if (V == "-lto-split-by-callgraph=false")
         Enabled = false;
     }
   }

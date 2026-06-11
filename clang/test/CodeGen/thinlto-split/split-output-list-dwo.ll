@@ -30,7 +30,7 @@
 ; RUN:   -split-dwarf-output %t.split.o.dwo \
 ; RUN:   -o %t.split.o -x ir %t.o \
 ; RUN:   -debug-info-kind=constructor -dwarf-version=5 \
-; RUN:   -mllvm -thinlto-split=true \
+; RUN:   -mllvm -lto-split-by-callgraph=true \
 ; RUN:   -mllvm -thinlto-split-partitions=2 \
 ; RUN:   -mllvm -thinlto-split-module-size-threshold=0 \
 ; RUN:   -mllvm -thinlto-split-module-size-rate-threshold=2.0
@@ -102,7 +102,7 @@
 ; RUN:   -split-dwarf-file %t.single.o.dwo \
 ; RUN:   -o %t.single.o -x ir %t.o \
 ; RUN:   -debug-info-kind=constructor -dwarf-version=5 \
-; RUN:   -mllvm -thinlto-split=true \
+; RUN:   -mllvm -lto-split-by-callgraph=true \
 ; RUN:   -mllvm -thinlto-split-partitions=2 \
 ; RUN:   -mllvm -thinlto-split-module-size-threshold=0 \
 ; RUN:   -mllvm -thinlto-split-module-size-rate-threshold=2.0
@@ -127,7 +127,7 @@
 ; RUN:   -split-dwarf-output %t.nosplit.o.dwo \
 ; RUN:   -o %t.nosplit.o -x ir %t.o \
 ; RUN:   -debug-info-kind=constructor -dwarf-version=5 \
-; RUN:   -mllvm -thinlto-split=false
+; RUN:   -mllvm -lto-split-by-callgraph=false
 
 ; RUN: ls %t.nosplit.o.dwo
 ; RUN: not ls %t.nosplit.o.thinlto-split.0.dwo 2>/dev/null
