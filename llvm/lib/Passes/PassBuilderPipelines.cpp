@@ -335,7 +335,7 @@ extern cl::opt<bool> EnableMemProfContextDisambiguation;
 } // namespace llvm
 
 namespace llvm {
-cl::opt<bool> ThinLTOSplit("thinlto-split", cl::init(false),
+cl::opt<bool> LTOSplitByCG("thinlto-split", cl::init(false),
 			   cl::desc("split module in thinlto backend."));
 }
 
@@ -1183,7 +1183,7 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
   }
 
   if (LoadSampleProfile) {
-    if (!ThinLTOSplit) {
+    if (!LTOSplitByCG) {
       // Annotate sample profile right after early FPM to ensure freshness of
       // the debug info.
       MPM.addPass(SampleProfileLoaderPass(
