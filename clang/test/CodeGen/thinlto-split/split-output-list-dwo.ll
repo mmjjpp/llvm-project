@@ -31,7 +31,7 @@
 ; RUN:   -o %t.split.o -x ir %t.o \
 ; RUN:   -debug-info-kind=constructor -dwarf-version=5 \
 ; RUN:   -mllvm -lto-split-by-callgraph=true \
-; RUN:   -mllvm -lto-split-partitions=2 \
+; RUN:   -mllvm -lto-split-partitions=2
 
 ; --- Step 3a: Verify per-partition .dwo files exist ---
 ; RUN: ls %t.split.o.thinlto-split.0.dwo
@@ -101,9 +101,7 @@
 ; RUN:   -o %t.single.o -x ir %t.o \
 ; RUN:   -debug-info-kind=constructor -dwarf-version=5 \
 ; RUN:   -mllvm -lto-split-by-callgraph=true \
-; RUN:   -mllvm -lto-split-partitions=2 \
-; RUN:   -mllvm -thinlto-split-module-size-threshold=0 \
-; RUN:   -mllvm -thinlto-split-module-size-rate-threshold=2.0
+; RUN:   -mllvm -lto-split-partitions=2
 
 ; --- Step 5a: Verify per-partition .dwo files exist even without -split-dwarf-output ---
 ; RUN: ls %t.single.o.thinlto-split.0.dwo

@@ -34,9 +34,7 @@
 ; RUN:   -thinlto-split-output-list=%t.cc1.rsp \
 ; RUN:   -o %t.cc1.o -x ir %t.o \
 ; RUN:   -mllvm -lto-split-by-callgraph=true \
-; RUN:   -mllvm -lto-split-partitions=2 \
-; RUN:   -mllvm -thinlto-split-module-size-threshold=0 \
-; RUN:   -mllvm -thinlto-split-module-size-rate-threshold=2.0
+; RUN:   -mllvm -lto-split-partitions=2
 
 ; Verify RSP contains partition objects in order 0, 1
 ; RSP-RSP: {{.*\.thinlto-split\.0\.o}}
@@ -105,9 +103,7 @@
 ; RUN:   -B%S/Inputs/lld \
 ; RUN:   -save-temps -c -fthinlto-index=%t.o.thinlto.bc -x ir %t.o -o %t.save.o \
 ; RUN:   -mllvm -lto-split-by-callgraph=true \
-; RUN:   -mllvm -lto-split-partitions=2 \
-; RUN:   -mllvm -thinlto-split-module-size-threshold=0 \
-; RUN:   -mllvm -thinlto-split-module-size-rate-threshold=2.0 2>&1 | FileCheck %s --check-prefix=SAVE-TEMPS
+; RUN:   -mllvm -lto-split-partitions=2  2>&1 | FileCheck %s --check-prefix=SAVE-TEMPS
 
 ; cc1 must use -emit-obj (not -S) even with -save-temps
 ; SAVE-TEMPS: "-cc1"

@@ -593,20 +593,21 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C,
   // Needed for the "auto" case (no -thinlto-split-partitions), where the
   // splitter would otherwise pick one partition per call-graph root.
   unsigned PartitionLimit = ParallelCodeGenParallelismLevel;
-  if (C.UseExpandedThinLTOSplitTaskIds && C.ThinLTOSplitTaskIdStride != 0 &&
+  if (IsThinLTO &&
+      C.UseExpandedThinLTOSplitTaskIds && C.ThinLTOSplitTaskIdStride != 0 &&
       (PartitionLimit == 0 || PartitionLimit > C.ThinLTOSplitTaskIdStride))
     PartitionLimit = C.ThinLTOSplitTaskIdStride;
 
   SplitModuleCG SplitModuleCG(Mod, CombinedIndex, PartitionLimit);
   unsigned PartitionCount = SplitModuleCG.getPartitionNum();
-  if (!C.AcceptsMultipleOutputsPerTask && PartitionCount > 1)
+  if (IsThinLTO && !C.AcceptsMultipleOutputsPerTask && PartitionCount > 1)
     report_fatal_error(
         "The current LTO client does not support ThinLTO split codegen.");
-  if (C.UseExpandedThinLTOSplitTaskIds) {
+  if (IsThinLTO && C.UseExpandedThinLTOSplitTaskIds) {
     if (C.ThinLTOSplitTaskIdStride == 0)
       report_fatal_error(
           "ThinLTO split codegen expanded task ids require a non-zero stride.");
-    if (PartitionCount > C.ThinLTOSplitTaskIdStride)
+    if (IsThinLTO && PartitionCount > C.ThinLTOSplitTaskIdStride)
       report_fatal_error(
           "ThinLTO split codegen produced more partitions than the task id "
           "stride allows.");
@@ -615,7 +616,8 @@ static bool splitOptAndCodeGenThin(unsigned task, const Config &C,
 
   const auto HandleModulePartition = [&](std::unique_ptr<Module> MPart,
                                          unsigned PartitionId) {
-    unsigned PartitionTask = getThinLTOOutputTask(C, task, PartitionId);
+    unsigned PartitionTask = IsThinLTO ?
+                       getThinLTOOutputTask(C, task, PartitionId) : PartitionId;
     std::unique_ptr<TargetMachine> ThreadTM = createTargetMachine(C, T, *MPart);
 
     if (DoOpt) {
