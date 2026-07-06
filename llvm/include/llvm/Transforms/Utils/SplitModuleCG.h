@@ -82,6 +82,13 @@ public:
     return VTableRecord;
   }
 
+  /// Resolve virtual call targets from the function summary's TypeIdInfo.
+  /// For each VFuncId (type GUID + offset), look up the WPD resolution in
+  /// the CombinedIndex. If devirtualized to a single implementation, add
+  /// the resolved function as a called function in SCG.
+  void resolveVCallsFromSummary(const ModuleSummaryIndex &CombinedIndex,
+                                Function *F, SimplifyCallGraphNode *SCGNode);
+
 private:
   CallGraph &CG;
   Module &M;

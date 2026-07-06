@@ -5,6 +5,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/ModuleSummaryIndex.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/MD5.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -891,10 +892,70 @@ void SimplifyCallGraph::createSimplifyCallGraph(
         continue;
       SCGNode->addCalledFunction(getOrInsertFunction(Called));
     }
+
+    // Resolve virtual calls from function summary TypeIdInfo.
+    resolveVCallsFromSummary(CombinedIndex, F, SCGNode);
   }
 
   if (enablePrintSimplifyCallGraph)
     print();
+}
+
+void SimplifyCallGraph::resolveVCallsFromSummary(
+    const ModuleSummaryIndex &CombinedIndex, Function *F,
+    SimplifyCallGraphNode *SCGNode) {
+  // Look up the function's summary in the CombinedIndex.
+  auto VI = CombinedIndex.getValueInfo(F->getGUID());
+  if (!VI)
+    return;
+
+  // Helper to resolve a VFuncId via WPD resolutions stored in the
+  // CombinedIndex. The thin link phase has already devirtualized calls
+  // and stored the results in TypeIdSummary::WPDRes.
+  auto resolveVFuncId = [&](const FunctionSummary::VFuncId &VF) {
+    // VFuncId.GUID is the type identifier GUID. Look it up in the
+    // typeIds() map to get the TypeIdSummary (which contains WPDRes).
+    auto Range = CombinedIndex.typeIds().equal_range(VF.GUID);
+    for (auto It = Range.first; It != Range.second; ++It) {
+      const TypeIdSummary &TIS = It->second.second;
+      // WPDRes maps byte offset (from address point) to resolution.
+      auto WPDIt = TIS.WPDRes.find(VF.Offset);
+      if (WPDIt == TIS.WPDRes.end())
+        continue;
+      const WholeProgramDevirtResolution &Res = WPDIt->second;
+      // Only handle single-implementation devirtualization.
+      if (Res.TheKind != WholeProgramDevirtResolution::SingleImpl)
+        continue;
+      Function *Callee = M.getFunction(Res.SingleImplName);
+      if (!Callee || Callee->isDeclaration() || Callee == F)
+        continue;
+      SCGNode->addCalledFunction(getOrInsertFunction(Callee));
+    }
+  };
+
+  // Process all summaries for this GUID (there may be multiple in the
+  // combined index from different modules).
+  for (const auto &S : VI.getSummaryList()) {
+    auto *FS = dyn_cast<FunctionSummary>(S.get());
+    if (!FS)
+      continue;
+
+    // TypeTestAssumeVCalls: llvm.assume(llvm.type.test) with non-constant args
+    for (const auto &VF : FS->type_test_assume_vcalls())
+      resolveVFuncId(VF);
+
+    // TypeCheckedLoadVCalls: llvm.type.checked.load with non-constant args
+    for (const auto &VF : FS->type_checked_load_vcalls())
+      resolveVFuncId(VF);
+
+    // TypeTestAssumeConstVCalls: llvm.assume(llvm.type.test) with constant args
+    for (const auto &VC : FS->type_test_assume_const_vcalls())
+      resolveVFuncId(VC.VFunc);
+
+    // TypeCheckedLoadConstVCalls: llvm.type.checked.load with constant args
+    for (const auto &VC : FS->type_checked_load_const_vcalls())
+      resolveVFuncId(VC.VFunc);
+  }
 }
 
 
