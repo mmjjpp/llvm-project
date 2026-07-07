@@ -329,6 +329,11 @@ extern cl::opt<bool> PGOInstrumentColdFunctionOnly;
 extern cl::opt<bool> EnableMemProfContextDisambiguation;
 } // namespace llvm
 
+namespace llvm {
+cl::opt<bool> LTOSplitByCG("lto-split-by-callgraph", cl::init(false),
+			   cl::desc("Enable split module in thinlto backend."));
+}
+
 PipelineTuningOptions::PipelineTuningOptions() {
   LoopInterleaving = true;
   LoopVectorization = true;
@@ -1175,13 +1180,15 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
   }
 
   if (LoadSampleProfile) {
-    // Annotate sample profile right after early FPM to ensure freshness of
-    // the debug info.
-    MPM.addPass(SampleProfileLoaderPass(
-        PGOOpt->ProfileFile, PGOOpt->ProfileRemappingFile, Phase, FS));
-    // Cache ProfileSummaryAnalysis once to avoid the potential need to insert
-    // RequireAnalysisPass for PSI before subsequent non-module passes.
-    MPM.addPass(RequireAnalysisPass<ProfileSummaryAnalysis, Module>());
+    if (!LTOSplitByCG) {
+      // Annotate sample profile right after early FPM to ensure freshness of
+      // the debug info.
+      MPM.addPass(SampleProfileLoaderPass(
+          PGOOpt->ProfileFile, PGOOpt->ProfileRemappingFile, Phase, FS));
+      // Cache ProfileSummaryAnalysis once to avoid the potential need to insert
+      // RequireAnalysisPass for PSI before subsequent non-module passes.
+      MPM.addPass(RequireAnalysisPass<ProfileSummaryAnalysis, Module>());
+    }
     // Do not invoke ICP in the LTOPrelink phase as it makes it hard
     // for the profile annotation to be accurate in the LTO backend.
     if (!isLTOPreLink(Phase))
