@@ -2,15 +2,15 @@
 ; RUN: llvm-dis -o - %t0 | FileCheck --check-prefix=CHECK0 %s
 ; RUN: llvm-dis -o - %t1 | FileCheck --check-prefix=CHECK1 %s
 
-; CHECK0-DAG: declare void @foo()
+; CHECK0-DAG: declare !guid !{{[0-9]+}} void @foo()
 ; CHECK0-DAG: define void @bar()
-; CHECK0-DAG: declare void @call_foo()
+; CHECK0-DAG: declare !guid !{{[0-9]+}} void @call_foo()
 ; CHECK0-DAG: define void @call_bar()
 
 ; CHECK1-DAG: define void @foo()
-; CHECK1-DAG: declare void @bar()
+; CHECK1-DAG: declare !guid !{{[0-9]+}} void @bar()
 ; CHECK1-DAG: define void @call_foo()
-; CHECK1-DAG: declare void @call_bar()
+; CHECK1-DAG: declare !guid !{{[0-9]+}} void @call_bar()
 
 define void @foo() {
 entry:

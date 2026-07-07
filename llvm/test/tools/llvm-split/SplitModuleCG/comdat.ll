@@ -7,11 +7,11 @@
 ; CHECK0-DAG: define void @foo() comdat($group)
 ; CHECK0-DAG: define void @bar() comdat($group)
 ; CHECK0-DAG: define void @call_foo()
-; CHECK0-DAG: declare void @call_bar()
+; CHECK0-DAG: declare !guid !{{[0-9]+}} void @call_bar()
 ; CHECK1-DAG: @my_var = available_externally global i32 42
 ; CHECK1-DAG: define available_externally void @foo()
 ; CHECK1-DAG: define available_externally void @bar()
-; CHECK1-DAG: declare void @call_foo()
+; CHECK1-DAG: declare !guid !{{[0-9]+}} void @call_foo()
 ; CHECK1-DAG: define void @call_bar()
 
 $group = comdat any

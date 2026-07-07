@@ -11,7 +11,7 @@
 @foo_b.ifunc = internal ifunc void (), ptr @foo_b.resolver
 
 ; CHECK0-DAG: define hidden void @foo.impl()
-; CHECK1-DAG: declare hidden void @foo.impl()
+; CHECK1-DAG: define available_externally hidden void @foo.impl()
 
 define internal void @foo.impl() {
 entry:
@@ -20,8 +20,8 @@ entry:
 
 ; CHECK0-DAG: define hidden ptr @foo_a.resolver()
 ; CHECK0-DAG: define hidden ptr @foo_b.resolver()
-; CHECK1-DAG: declare hidden ptr @foo_a.resolver()
-; CHECK1-DAG: declare hidden ptr @foo_b.resolver()
+; CHECK1-DAG: define available_externally hidden ptr @foo_a.resolver()
+; CHECK1-DAG: declare !guid !{{[0-9]+}} hidden ptr @foo_b.resolver()
 
 define internal ptr @foo_a.resolver() {
 entry:
@@ -33,10 +33,10 @@ entry:
   ret ptr @foo.impl
 }
 
-; CHECK0-DAG: declare void @bar_a()
-; CHECK0-DAG: declare void @bar_b()
+; CHECK0-DAG: declare !guid !{{[0-9]+}} void @bar_a()
+; CHECK0-DAG: define void @bar_b()
 ; CHECK1-DAG: define void @bar_a()
-; CHECK1-DAG: define void @bar_b()
+; CHECK1-DAG: declare !guid !{{[0-9]+}} void @bar_b()
 
 define void @bar_a() {
 entry:

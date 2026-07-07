@@ -35,6 +35,7 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/IPO/GlobalDCE.h"
+#include "llvm/Transforms/Utils/AssignGUID.h"
 #include "llvm/Transforms/Utils/SplitModule.h"
 #include "llvm/Transforms/Utils/SplitModuleByCategory.h"
 #include "llvm/Transforms/Utils/SplitModuleCG.h"
@@ -357,6 +358,11 @@ int main(int argc, char **argv) {
 
     llvm::lto::Config Config;
     ModuleSummaryIndex CombinedIndex(false);
+    ModuleAnalysisManager MAM;
+    MAM.registerPass([&] {return PassInstrumentationAnalysis();});
+    ModulePassManager MPM;
+    MPM.addPass(AssignGUIDPass()); // Assign GUID
+    MPM.run(*M, MAM);
     SplitModuleCG SplitModuleCG(*M, CombinedIndex, NumOutputs);
     SplitModuleCG.SplitModule(HandleModulePartCG, Config);
     return 0;
