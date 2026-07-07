@@ -84,6 +84,16 @@ static cl::list<std::string>
                              "path matches this for -save-temps options"),
                     cl::CommaSeparated, cl::Hidden);
 
+static cl::opt<unsigned> ThinLTOSplitModuleSizeThreshold(
+    "thinlto-split-module-size-threshold", cl::Hidden, cl::init(500),
+    cl::desc("Control the amount of whether split in thinlto backend"
+             "accroding to the size of a module."));
+
+static cl::opt<float> ThinLTOSplitModuleSizeRateThreshold(
+    "thinlto-split-module-size-rate-threshold", cl::Hidden, cl::init(0.5),
+    cl::desc("Whether to split in thinlto backend based on the ratio of "
+             "(callgraph size)/(module size)"));
+
 static cl::opt<unsigned> LTOSplitPartitions(
     "lto-split-partitions", cl::Hidden, cl::init(0),
     cl::desc("Control split to how many partitions in lto backend."));
@@ -531,6 +541,92 @@ static void codegen(const Config &Conf, TargetMachine *TM,
     report_fatal_error(std::move(Err));
 }
 
+static unsigned calFunctionSize(const llvm::Function &F) {
+  unsigned size = 0;
+  for (const auto &BB : F)
+    size += std::distance(BB.begin(), BB.end());
+  return size;
+}
+
+static unsigned calModuleSize(const llvm::Module &M) {
+  unsigned size = 0;
+  for (const auto &F : M)
+    size += calFunctionSize(F);
+  return size;
+}
+
+static bool canDoSplitModule(const llvm::Module &M) {
+  if (calModuleSize(M) < ThinLTOSplitModuleSizeThreshold)
+    return false;
+  return true;
+}
+
+static bool HasLargeCG(Module &Mod, const ModuleSummaryIndex &CombinedIndex) {
+  // Check whether there has large callgraphs. When multiple callgraphs
+  // are split, thinlto parallel compilation can bring benefits.
+  llvm::CallGraph CG(Mod);
+  llvm::SimplifyCallGraph SCG(CG, CombinedIndex, Mod);
+  DenseSet<const Function *> visitedFuncs;
+  DenseMap<const Function *, uint64_t> EntryFuncs;
+
+  auto visitedSCG = [&](const Function *F) {
+    SmallVector<const Function *> WorkList;
+    DenseSet<const Function *> FindedFuncs;
+    WorkList.push_back(F);
+    while (!WorkList.empty()) {
+      const auto &CurFn = *WorkList.pop_back_val();
+      for (auto &SCGNode : *SCG.at(&CurFn)) {
+        auto *Callee = SCGNode->getFunction();
+        if (!Callee || Callee->isDeclaration())
+          continue;
+
+        auto [It, Inserted] = FindedFuncs.insert(Callee);
+        if (Inserted) {
+          WorkList.push_back(Callee);
+          EntryFuncs[F] += calFunctionSize(*Callee);
+          visitedFuncs.insert(Callee);
+        }
+      }
+    }
+  };
+
+  for (auto &NodePair : SCG) {
+    SimplifyCallGraphNode *SCGNode = NodePair.second.get();
+    Function *F = SCGNode->getFunction();
+    if (F && SCGNode->getNumReferences() == 0) {
+      EntryFuncs[F] = calFunctionSize(*F);
+      visitedFuncs.insert(F);
+    }
+  }
+
+  for (auto &Entry : EntryFuncs) {
+    visitedSCG(Entry.first);
+  }
+
+  for (auto &F : Mod) {
+    if (F.isDeclaration())
+      continue;
+    if (visitedFuncs.count(&F))
+      continue;
+    visitedFuncs.insert(&F);
+    EntryFuncs[&F] = calFunctionSize(F);
+    visitedSCG(&F);
+  }
+  uint64_t moduleSize = calModuleSize(Mod);
+
+  int OverThreshold = 0;
+  for (auto &SizePair : EntryFuncs) {
+    if (SizePair.second >= moduleSize * ThinLTOSplitModuleSizeRateThreshold) {
+      OverThreshold += 1;
+    }
+  }
+  if (OverThreshold == 1) {
+    return false;
+  }
+
+  return true;
+}
+
 static bool splitOptAndCodeGenThin(unsigned task, const Config &C,
                                    TargetMachine *TM, AddStreamFn AddStream,
                                    unsigned ParallelCodeGenParallelismLevel,
@@ -760,10 +856,21 @@ Error lto::thinBackend(const Config &Conf, unsigned Task, AddStreamFn AddStream,
   // Set the partial sample profile ratio in the profile summary module flag of
   // the module, if applicable.
   Mod.setPartialSampleProfileRatio(CombinedIndex);
+  bool ProfitableToSplit = true;
+  if (LTOSplitByCG) {
+    if (!canDoSplitModule(Mod) || !HasLargeCG(Mod, CombinedIndex)) {
+      ProfitableToSplit = false;
+      LLVM_DEBUG(dbgs() << "warning: thinlto split not enable for module: "
+                        << Mod.getName() << "\n");
+    } else {
+      LLVM_DEBUG(dbgs() << "thinlto: split codegen for module: "
+                        << Mod.getName() << "\n");
+    }
+  }
 
   LLVM_DEBUG(dbgs() << "Running ThinLTO\n");
   if (CodeGenOnly) {
-    if (LTOSplitByCG)
+    if (LTOSplitByCG && ProfitableToSplit)
       splitOptAndCodeGenThin(Task, Conf, TM.get(), AddStream,
                              LTOSplitPartitions, Mod, CombinedIndex,
                              CmdArgs, false, IRAddStream, BitcodeLibFuncs);
@@ -780,7 +887,7 @@ Error lto::thinBackend(const Config &Conf, unsigned Task, AddStreamFn AddStream,
   auto OptimizeAndCodegen =
       [&](Module &Mod, TargetMachine *TM,
           LLVMRemarkFileHandle DiagnosticOutputFile) {
-        if (LTOSplitByCG) {
+        if (LTOSplitByCG && ProfitableToSplit) {
           if (!splitOptAndCodeGenThin(
                   Task, Conf, TM, AddStream, LTOSplitPartitions, Mod,
                   CombinedIndex, CmdArgs, true, IRAddStream, BitcodeLibFuncs))
