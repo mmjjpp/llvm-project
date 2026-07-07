@@ -9,6 +9,7 @@
 #include "llvm/Support/MD5.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <mutex>
+#include <numa.h>
 #include <thread>
 
 static std::mutex split_module_mtx;
@@ -22,6 +23,10 @@ namespace {
 static cl::opt<bool> enablePrintSimplifyCallGraph(
     "enable-print-simplify-callgraph", cl::Hidden, cl::init(false),
     cl::desc("print SimplifyCallGraph"));
+
+static cl::opt<bool> BindToNuma(
+    "bind-to-numa", cl::Hidden, cl::init(false),
+    cl::desc("binding to numa before clone module"));
 
 static cl::opt<bool> ParallelCloneModule(
     "parallel-cloneModule", cl::Hidden, cl::init(false),
@@ -679,6 +684,11 @@ void SplitModuleCG::SplitModule(ModuleCreationCallback ModuleCallback,
   std::vector<std::thread> Threads;
   Threads.reserve(N);
   if (ParallelCloneModule) {
+    // When open the option bind-to-numa, set the multi-threads into
+    // the numa of main thread to reduce memory access latency.
+    int MainNuma;
+    if (BindToNuma && numa_available() == 0)
+      MainNuma = numa_node_of_cpu(sched_getcpu());
     // We want to clone the whole module into a new context to multi-thread
     // the cloneModule. We do it by serializing the whole module to bitcode
     // (while still on the main thread, in order to avoid data races) and
