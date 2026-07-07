@@ -315,9 +315,32 @@ void tools::gnutools::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     }
     const char *Exec = Args.MakeArgString(LLDPath);
 
+    // Check whether split DWARF is active; if so, set up DWP merging.
+    std::string DwoResponseFile;
+    std::string DwpExecutable;
+    std::string DwpOutput;
+    bool CleanupDwo = !D.isSaveTempsEnabled();
+    if (Args.hasArg(options::OPT_gsplit_dwarf)) {
+      DwoResponseFile = tools::getThinLTOSplitDwoResponseFile(BaseInput);
+      C.addTempFile(Args.MakeArgString(DwoResponseFile));
+      SmallString<128> DwpPath(Output.getFilename());
+      llvm::sys::path::replace_extension(DwpPath, ".dwo");
+      DwpOutput = std::string(DwpPath);
+
+      std::string FoundDwp = ToolChain.GetProgramPath("llvm-dwp");
+      if (!llvm::sys::fs::can_execute(FoundDwp))
+        FoundDwp = ToolChain.GetProgramPath("dwp");
+      if (!llvm::sys::fs::can_execute(FoundDwp)) {
+        D.Diag(clang::diag::err_drv_lto_split_requires_dwp) << FoundDwp;
+        return;
+      }
+      DwpExecutable = FoundDwp;
+    }
+
     C.addCommand(std::make_unique<ThinLTOMergeCommand>(
         JA, *this, ResponseFileSupport::AtFileCurCP(), Exec, CmdArgs, Inputs,
-        Output, ResponseFile, !D.isSaveTempsEnabled()));
+        Output, ResponseFile, !D.isSaveTempsEnabled(), DwoResponseFile,
+        DwpExecutable, DwpOutput, CleanupDwo));
     return;
   }
 

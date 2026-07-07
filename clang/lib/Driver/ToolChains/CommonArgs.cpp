@@ -959,6 +959,10 @@ std::string tools::getThinLTOSplitResponseFile(StringRef Output) {
   return (Twine(Output) + ".thinlto-split.rsp").str();
 }
 
+std::string tools::getThinLTOSplitDwoResponseFile(StringRef Output) {
+  return (Twine(Output) + ".thinlto-split-dwo.rsp").str();
+}
+
 bool tools::isThinLTOSplitMergeEnabled(const ToolChain &TC,
                                        const ArgList &Args) {
   // Driver-mediated split applies to the distributed backend compile only: cc1

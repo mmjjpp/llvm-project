@@ -165,6 +165,11 @@ bool isThinLTOSplitEnabled(const llvm::opt::ArgList &Args);
 /// (`ld.lld -r @<file>`); shared so both agree on the name.
 std::string getThinLTOSplitResponseFile(llvm::StringRef Output);
 
+/// Response-file path listing the per-partition DWO files for cc1 output
+/// \p Output.  Written by cc1 (when -gsplit-dwarf is active) and read by
+/// ThinLTOMergeJobAction (`llvm-dwp -o ... @<file>`).
+std::string getThinLTOSplitDwoResponseFile(llvm::StringRef Output);
+
 /// Single gating predicate (shared by the cc1 flag and the merge action) for
 /// whether the driver splits a distributed ThinLTO compile and merges it with
 /// `ld.lld -r`.

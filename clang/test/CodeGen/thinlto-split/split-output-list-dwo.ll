@@ -11,6 +11,7 @@
 ;   6. No 4294967295.dwo is generated
 ;   7. No shared single .dwo file is generated (no output.dwo without partition suffix)
 ;   8. Both -gsplit-dwarf=split and -gsplit-dwarf=single produce per-partition .dwo
+;   9. The DWO response file (.thinlto-split-dwo.rsp) is generated and lists all .dwo files
 
 ; --- Step 1: Generate ThinLTO bitcode with debug info ---
 ; The IR module must have !dbg metadata to produce DWARF output.
@@ -77,6 +78,15 @@
 ; RUN: llvm-dwarfdump -debug-info %t.split.o.thinlto-split.1.dwo | FileCheck %s --check-prefix=DWO_DWO1
 ; DWO_DWO1: DWO_id = 0x{{[0-9a-f]+}}
 
+; --- Step 3g: Verify the DWO response file was written and can drive llvm-dwp ---
+; RUN: ls %t.split.o.thinlto-split-dwo.rsp
+; RUN: cat %t.split.o.thinlto-split-dwo.rsp | FileCheck %s --check-prefix=DWO-RSP-SPLIT
+; DWO-RSP-SPLIT: {{.*}}thinlto-split.0.dwo
+; DWO-RSP-SPLIT: {{.*}}thinlto-split.1.dwo
+; RUN: llvm-dwp -o %t.split.pkg.dwo @%t.split.o.thinlto-split-dwo.rsp
+; RUN: llvm-readobj -h %t.split.pkg.dwo | FileCheck %s --check-prefix=DWP-SPLIT
+; DWP-SPLIT: Type: Relocatable
+
 ; --- Step 4: Verify lld -r merge preserves .dwo references ---
 ; RUN: ld.lld -r -o %t.merged.o %t.split.o.thinlto-split.0.o %t.split.o.thinlto-split.1.o
 
@@ -120,6 +130,12 @@
 ; SINGLE1: DW_TAG_skeleton_unit
 ; SINGLE1: DW_AT_dwo_name{{.*}}thinlto-split.1.dwo
 
+; --- Step 5c: Verify the DWO response file for single mode ---
+; RUN: ls %t.single.o.thinlto-split-dwo.rsp
+; RUN: cat %t.single.o.thinlto-split-dwo.rsp | FileCheck %s --check-prefix=DWO-RSP-SINGLE
+; DWO-RSP-SINGLE: {{.*}}thinlto-split.0.dwo
+; DWO-RSP-SINGLE: {{.*}}thinlto-split.1.dwo
+
 ; --- Step 6: Verify non-split path with gsplit-dwarf still works ---
 ; RUN: %clang_cc1 -triple aarch64-unknown-linux-gnu \
 ; RUN:   -emit-obj -fthinlto-index=%t.o.thinlto.bc \
@@ -131,6 +147,7 @@
 
 ; RUN: ls %t.nosplit.o.dwo
 ; RUN: not ls %t.nosplit.o.thinlto-split.0.dwo 2>/dev/null
+; RUN: not ls %t.nosplit.o.thinlto-split-dwo.rsp 2>/dev/null
 
 ; --- IR source module with debug metadata ---
 target triple = "aarch64-unknown-linux-gnu"

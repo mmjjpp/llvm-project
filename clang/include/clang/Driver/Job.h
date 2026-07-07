@@ -266,9 +266,11 @@ public:
 };
 
 /// Merges the per-partition objects from ThinLTO split codegen into one
-/// relocatable object (`ld.lld -r`). The partition count is only known at
-/// codegen time, so after the merge this reads the response file to remove
-/// them (unless -save-temps); the response file is a normal Compilation temp.
+/// relocatable object (`ld.lld -r`) and, when split DWARF is active, merges
+/// per-partition .dwo files into a single .dwp (`llvm-dwp`). The partition
+/// count is only known at codegen time, so after the merge this reads the
+/// response files to remove the partition outputs (unless -save-temps); the
+/// response files are normal Compilation temps.
 class ThinLTOMergeCommand : public Command {
   /// Response file listing the partition objects to merge.
   std::string SplitOutputList;
@@ -277,7 +279,20 @@ class ThinLTOMergeCommand : public Command {
   /// under -save-temps).
   bool CleanupSplitOutputs;
 
+  /// Response file listing the per-partition .dwo files (empty = no DWO).
+  std::string SplitDwoOutputList;
+
+  /// Path to llvm-dwp executable (empty = skip DWO merge).
+  std::string DwpExecutable;
+
+  /// Path for the output .dwp file.
+  std::string DwpOutput;
+
+  /// Whether to remove per-partition .dwo files after a successful dwp merge.
+  bool CleanupSplitDwoOutputs;
+
   void cleanupSplitOutputs() const;
+  void cleanupSplitDwoOutputs() const;
 
 public:
   ThinLTOMergeCommand(const Action &Source, const Tool &Creator,
@@ -285,7 +300,11 @@ public:
                       const char *Executable,
                       const llvm::opt::ArgStringList &Arguments,
                       ArrayRef<InputInfo> Inputs, ArrayRef<InputInfo> Outputs,
-                      StringRef SplitOutputList, bool CleanupSplitOutputs);
+                      StringRef SplitOutputList, bool CleanupSplitOutputs,
+                      StringRef SplitDwoOutputList = "",
+                      StringRef DwpExecutable = "",
+                      StringRef DwpOutput = "",
+                      bool CleanupSplitDwoOutputs = false);
 
   int Execute(ArrayRef<std::optional<StringRef>> Redirects, std::string *ErrMsg,
               bool *ExecutionFailed) const override;

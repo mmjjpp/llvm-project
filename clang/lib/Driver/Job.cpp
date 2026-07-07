@@ -16,6 +16,7 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -460,18 +461,38 @@ ThinLTOMergeCommand::ThinLTOMergeCommand(
     ResponseFileSupport ResponseSupport, const char *Executable,
     const llvm::opt::ArgStringList &Arguments, ArrayRef<InputInfo> Inputs,
     ArrayRef<InputInfo> Outputs, StringRef SplitOutputList,
-    bool CleanupSplitOutputs)
+    bool CleanupSplitOutputs, StringRef SplitDwoOutputList,
+    StringRef DwpExecutable, StringRef DwpOutput,
+    bool CleanupSplitDwoOutputs)
     : Command(Source, Creator, ResponseSupport, Executable, Arguments, Inputs,
               Outputs),
       SplitOutputList(SplitOutputList),
-      CleanupSplitOutputs(CleanupSplitOutputs) {}
+      CleanupSplitOutputs(CleanupSplitOutputs),
+      SplitDwoOutputList(SplitDwoOutputList),
+      DwpExecutable(DwpExecutable), DwpOutput(DwpOutput),
+      CleanupSplitDwoOutputs(CleanupSplitDwoOutputs) {}
 
 void ThinLTOMergeCommand::cleanupSplitOutputs() const {
-  // Remove the partition objects listed in the response file. Per-partition
-  // .dwo files (split DWARF) are deliberately kept: they are final debug output
-  // referenced by the merged object's skeleton CUs.
+  // Remove the partition .o files listed in the response file.
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> MBOrErr =
       llvm::MemoryBuffer::getFile(SplitOutputList, /*IsText=*/true,
+                                  /*RequiresNullTerminator=*/false);
+  if (!MBOrErr)
+    return;
+
+  llvm::BumpPtrAllocator Alloc;
+  llvm::StringSaver Saver(Alloc);
+  SmallVector<const char *, 16> OutputFiles;
+  llvm::cl::TokenizeGNUCommandLine((*MBOrErr)->getBuffer(), Saver, OutputFiles);
+  for (const char *OutputFile : OutputFiles)
+    llvm::sys::fs::remove(OutputFile);
+}
+
+void ThinLTOMergeCommand::cleanupSplitDwoOutputs() const {
+  if (SplitDwoOutputList.empty())
+    return;
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> MBOrErr =
+      llvm::MemoryBuffer::getFile(SplitDwoOutputList, /*IsText=*/true,
                                   /*RequiresNullTerminator=*/false);
   if (!MBOrErr)
     return;
@@ -487,13 +508,35 @@ void ThinLTOMergeCommand::cleanupSplitOutputs() const {
 int ThinLTOMergeCommand::Execute(ArrayRef<std::optional<StringRef>> Redirects,
                                  std::string *ErrMsg,
                                  bool *ExecutionFailed) const {
+  // Phase 1: ld.lld -r (unchanged)
   int Res = Command::Execute(Redirects, ErrMsg, ExecutionFailed);
-  // Clean up the partition inputs only on full success; keep them on any
-  // failure so the failing `ld.lld -r` can be re-run or inspected.
   bool Launched = !ExecutionFailed || !*ExecutionFailed;
   if (CleanupSplitOutputs && Launched && Res == 0)
     cleanupSplitOutputs();
-  return Res;
+  if (Res != 0 || DwpExecutable.empty())
+    return Res;
+
+  // Phase 2: llvm-dwp -o <output>.dwo @<dwo-rsp>
+  if (!SplitDwoOutputList.empty()) {
+    std::string AtFile = (Twine("@") + SplitDwoOutputList).str();
+    SmallVector<StringRef, 32> DwpArgs;
+    DwpArgs.push_back(DwpExecutable);
+    DwpArgs.push_back("-o");
+    DwpArgs.push_back(DwpOutput);
+    DwpArgs.push_back(AtFile);
+
+    int DwpRes = llvm::sys::ExecuteAndWait(
+        DwpExecutable, DwpArgs,
+        /*Environment=*/std::nullopt, Redirects,
+        /*SecondsToWait=*/0, /*MemoryLimit=*/0, ErrMsg, ExecutionFailed);
+    bool DwpLaunched = !ExecutionFailed || !*ExecutionFailed;
+    if (CleanupSplitDwoOutputs && DwpLaunched && DwpRes == 0)
+      cleanupSplitDwoOutputs();
+    if (DwpRes != 0)
+      return DwpRes;
+  }
+
+  return 0;
 }
 
 void JobList::Print(raw_ostream &OS, const char *Terminator, bool Quote,

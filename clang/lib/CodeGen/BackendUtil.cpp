@@ -1377,6 +1377,10 @@ static std::string getThinLTOSplitOutputFile(const FrontendOptions &Opts,
       .str();
 }
 
+static std::string getThinLTOSplitDwoResponseFile(StringRef Output) {
+  return (Twine(Output) + ".thinlto-split-dwo.rsp").str();
+}
+
 static bool writeThinLTOSplitOutputList(DiagnosticsEngine &Diags,
                                         StringRef OutputList,
                                         ArrayRef<std::string> Outputs) {
@@ -1551,6 +1555,25 @@ runThinLTOBackend(CompilerInstance &CI, ModuleSummaryIndex *CombinedIndex,
       Outputs.push_back(Pair.second);
     if (!writeThinLTOSplitOutputList(Diags, SplitOutputList, Outputs))
       return;
+
+    if (!CGOpts.SplitDwarfFile.empty()) {
+      SmallString<128> DwoStem(CGOpts.SplitDwarfOutput.empty()
+                                   ? CGOpts.SplitDwarfFile
+                                   : CGOpts.SplitDwarfOutput);
+      if (llvm::sys::path::extension(DwoStem) == ".dwo")
+        llvm::sys::path::replace_extension(DwoStem, "");
+
+      SmallVector<std::string, 0> DwoOutputs;
+      for (const auto &Pair : SplitOutputMap) {
+        DwoOutputs.push_back(
+            (Twine(DwoStem) + ".thinlto-split." + Twine(Pair.first) + ".dwo")
+                .str());
+      }
+      std::string DwoResponseFile =
+          getThinLTOSplitDwoResponseFile(CI.getFrontendOpts().OutputFile);
+      if (!writeThinLTOSplitOutputList(Diags, DwoResponseFile, DwoOutputs))
+        return;
+    }
   }
 }
 
@@ -1641,6 +1664,25 @@ void clang::emitBackendOutput(CompilerInstance &CI, CodeGenOptions &CGOpts,
             Diags, CI.getFrontendOpts().ThinLTOSplitOutputList,
             ArrayRef<std::string>(&FallbackOutputPath, 1)))
       return;
+
+    // Write the DWO response file for the single fallback partition.
+    if (!CGOpts.SplitDwarfFile.empty()) {
+      SmallString<128> DwoStem(CGOpts.SplitDwarfOutput.empty()
+                                   ? CGOpts.SplitDwarfFile
+                                   : CGOpts.SplitDwarfOutput);
+      if (llvm::sys::path::extension(DwoStem) == ".dwo")
+        llvm::sys::path::replace_extension(DwoStem, "");
+
+      std::string DwoPath =
+          (Twine(DwoStem) + ".thinlto-split.0.dwo").str();
+      std::string DwoResponseFile =
+          getThinLTOSplitDwoResponseFile(
+              CI.getFrontendOpts().OutputFile);
+      if (!writeThinLTOSplitOutputList(
+              Diags, DwoResponseFile,
+              ArrayRef<std::string>(&DwoPath, 1)))
+        return;
+    }
   }
 
   // Verify clang's TargetInfo DataLayout against the LLVM TargetMachine's
