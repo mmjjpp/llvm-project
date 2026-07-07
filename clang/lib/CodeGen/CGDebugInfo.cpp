@@ -59,6 +59,10 @@
 using namespace clang;
 using namespace clang::CodeGen;
 
+namespace llvm {
+extern cl::opt<bool> ThinLTOSplit;
+}
+
 static SourceLocation getMacroDebugLoc(const CodeGenModule &CGM,
                                        SourceLocation Loc) {
   if (CGM.getCodeGenOpts().DebugInfoMacroExpansionLoc)
@@ -1445,7 +1449,7 @@ static SmallString<256> getTypeIdentifier(const TagType *Ty, CodeGenModule &CGM,
   if (!needsTypeIdentifier(TD, CGM, TheCU))
     return Identifier;
   if (const auto *RD = dyn_cast<CXXRecordDecl>(TD))
-    if (RD->getDefinition())
+    if (RD->getDefinition() && !llvm::ThinLTOSplit)
       if (RD->isDynamicClass() &&
           CGM.getVTableLinkage(RD) == llvm::GlobalValue::ExternalLinkage)
         return Identifier;
