@@ -58,6 +58,7 @@ public:
 
   bool hasIntegratedCPP() const override { return false; }
   bool isLinkJob() const override { return true; }
+  bool canConstructThinLTOMergeJob() const override { return true; }
 
   void ConstructJob(Compilation &C, const JobAction &JA,
                     const InputInfo &Output, const InputInfoList &Inputs,
