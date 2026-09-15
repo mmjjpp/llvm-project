@@ -56,7 +56,6 @@
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
-#include "llvm/Transforms/Utils/SplitModuleCommon.h"
 #include <cassert>
 #include <cmath>
 #include <utility>
@@ -163,6 +162,19 @@ static auto formatRatioOf(CostType Num, CostType Dem) {
 static bool isNonCopyable(const Function &F) {
   return F.hasExternalLinkage() || !F.isDefinitionExact() ||
          AMDGPU::isEntryFunctionCC(F.getCallingConv());
+}
+
+/// If \p GV has local linkage, make it external + hidden.
+static void externalize(GlobalValue &GV) {
+  if (GV.hasLocalLinkage()) {
+    GV.setLinkage(GlobalValue::ExternalLinkage);
+    GV.setVisibility(GlobalValue::HiddenVisibility);
+  }
+
+  // Unnamed entities must be named consistently between modules. setName will
+  // give a distinct name to each such entity.
+  if (!GV.hasName())
+    GV.setName("__llvmsplit_unnamed");
 }
 
 /// Cost analysis function. Calculates the cost of each function in \p M
@@ -1385,7 +1397,7 @@ static void splitAMDGPUModule(
       if (Fn.hasLocalLinkage() && Fn.hasAddressTaken()) {
         LLVM_DEBUG(dbgs() << "[externalize] "; Fn.printAsOperand(dbgs());
                    dbgs() << " because its address is taken\n");
-        externalizeGlobal(Fn);
+        externalize(Fn);
       }
     }
   }
@@ -1396,14 +1408,14 @@ static void splitAMDGPUModule(
     for (auto &GV : M.globals()) {
       if (GV.hasLocalLinkage())
         LLVM_DEBUG(dbgs() << "[externalize] GV " << GV.getName() << '\n');
-      externalizeGlobal(GV);
+      externalize(GV);
     }
   }
 
   for (auto &GA : M.aliases()) {
     if (GA.hasLocalLinkage()) {
       LLVM_DEBUG(dbgs() << "[externalize] alias " << GA.getName() << '\n');
-      externalizeGlobal(GA);
+      externalize(GA);
     }
   }
 

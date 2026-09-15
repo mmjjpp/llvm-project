@@ -36,7 +36,6 @@
 #include "llvm/Support/MD5.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
-#include "llvm/Transforms/Utils/SplitModuleCommon.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <cassert>
 #include <iterator>
@@ -126,7 +125,8 @@ static void findPartitions(Module &M, ClusterIDMapType &ClusterIDMap,
     if (GV.isDeclaration())
       return;
 
-    nameUnnamedGlobalValue(GV);
+    if (!GV.hasName())
+      GV.setName("__llvmsplit_unnamed");
 
     // Comdat groups must not be partitioned. For comdat groups that contain
     // locals, record all their members here so we can keep them together.
@@ -203,6 +203,18 @@ static void findPartitions(Module &M, ClusterIDMapType &ClusterIDMap,
   }
 }
 
+static void externalize(GlobalValue *GV) {
+  if (GV->hasLocalLinkage()) {
+    GV->setLinkage(GlobalValue::ExternalLinkage);
+    GV->setVisibility(GlobalValue::HiddenVisibility);
+  }
+
+  // Unnamed entities must be named consistently between modules. setName will
+  // give a distinct name to each such entity.
+  if (!GV->hasName())
+    GV->setName("__llvmsplit_unnamed");
+}
+
 // Returns whether GV should be in partition (0-based) I of N.
 static bool isInPartition(const GlobalValue *GV, unsigned I, unsigned N) {
   if (const GlobalObject *Root = getGVPartitioningRoot(GV))
@@ -230,13 +242,13 @@ void llvm::SplitModule(
     bool PreserveLocals, bool RoundRobin) {
   if (!PreserveLocals) {
     for (Function &F : M)
-      externalizeGlobal(F);
+      externalize(&F);
     for (GlobalVariable &GV : M.globals())
-      externalizeGlobal(GV);
+      externalize(&GV);
     for (GlobalAlias &GA : M.aliases())
-      externalizeGlobal(GA);
+      externalize(&GA);
     for (GlobalIFunc &GIF : M.ifuncs())
-      externalizeGlobal(GIF);
+      externalize(&GIF);
   }
 
   // This performs splitting without a need for externalization, which might not
