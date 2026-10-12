@@ -20,7 +20,6 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
-#include "llvm/LTO/Config.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
@@ -352,11 +351,8 @@ int main(int argc, char **argv) {
       Out->keep();
     };
 
-    llvm::lto::Config Config;
     SplitModuleCG SplitModuleCG(*M, NumOutputs);
-    SplitModuleCG.splitModule(HandleModulePartCG, [&] {
-      return std::make_unique<llvm::lto::LTOLLVMContext>(Config);
-    });
+    SplitModuleCG.splitModule(HandleModulePartCG);
     return 0;
   }
 

@@ -35,8 +35,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MD5.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/Utils/Cloning.h"
-#include "llvm/Transforms/Utils/ValueMapper.h"
+#include "llvm/Transforms/Utils/SplitModuleUtils.h"
 #include <cassert>
 #include <iterator>
 #include <memory>
@@ -228,14 +227,7 @@ void llvm::SplitModule(
     function_ref<void(std::unique_ptr<Module> MPart)> ModuleCallback,
     bool PreserveLocals, bool RoundRobin) {
   if (!PreserveLocals) {
-    for (Function &F : M)
-      F.externalize();
-    for (GlobalVariable &GV : M.globals())
-      GV.externalize();
-    for (GlobalAlias &GA : M.aliases())
-      GA.externalize();
-    for (GlobalIFunc &GIF : M.ifuncs())
-      GIF.externalize();
+    splitmodule::externalize(M, [](const GlobalValue &) { return true; });
   }
 
   // This performs splitting without a need for externalization, which might not
@@ -278,20 +270,22 @@ void llvm::SplitModule(
     }
   }
 
+  SmallVector<unsigned> PartitionIds;
+  for (unsigned I = 0; I < N; ++I)
+    PartitionIds.push_back(I);
+
+  auto ShouldCloneDefinition = [&](const GlobalValue *GV, unsigned I) {
+    if (auto It = ClusterIDMap.find(GV); It != ClusterIDMap.end())
+      return It->second == I;
+    return isInPartition(GV, I, N);
+  };
+
   // FIXME: We should be able to reuse M as the last partition instead of
   // cloning it. Note that the callers at the moment expect the module to
   // be preserved, so will need some adjustments as well.
-  for (unsigned I = 0; I < N; ++I) {
-    ValueToValueMapTy VMap;
-    std::unique_ptr<Module> MPart(
-        CloneModule(M, VMap, [&](const GlobalValue *GV) {
-          if (auto It = ClusterIDMap.find(GV); It != ClusterIDMap.end())
-            return It->second == I;
-          else
-            return isInPartition(GV, I, N);
-        }));
-    if (I != 0)
-      MPart->removeModuleInlineAsm();
-    ModuleCallback(std::move(MPart));
-  }
+  splitmodule::materializePartitions(
+      M, PartitionIds, ShouldCloneDefinition,
+      [&](std::unique_ptr<Module> MPart, unsigned) {
+        ModuleCallback(std::move(MPart));
+      });
 }

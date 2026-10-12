@@ -12,25 +12,21 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Utils/SplitModuleCG.h"
-#include "llvm/Bitcode/BitcodeReader.h"
-#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MD5.h"
-#include "llvm/Support/ThreadPool.h"
-#include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Support/Threading.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 using namespace llvm;
 
 #define DEBUG_TYPE "split-module-cg"
 
-static cl::opt<bool>
-    EnablePrintSimplifiedCallGraph("enable-print-simplified-callgraph",
-                                   cl::Hidden, cl::init(false),
-                                   cl::desc("print SimplifiedCallGraph"));
+static cl::opt<bool> EnablePrintSimplifiedCallGraph(
+    "enable-print-simplified-callgraph", cl::Hidden, cl::init(false),
+    cl::desc("print the module splitting graph"));
 
 namespace {
 
@@ -93,18 +89,19 @@ std::vector<DenseSet<const Function *>> SplitModuleCG::doPartitioning() {
   for (unsigned I = 0; I < NumPartitions; ++I)
     BalancingQueue.emplace_back(I, 0);
 
-  for (auto &CurFn : FWDWorkList) {
+  for (const WorkListEntry &Entry : WorkList) {
     // Normal "load-balancing", assign to partition with least pressure.
     auto [PID, _] = BalancingQueue.back();
 
-    // Insert the root function and its dependencies into the partition,
-    // tracking the cost of newly inserted functions so the balancing queue
-    // can be updated. CurFn.Dependencies includes the root F itself.
+    // Insert the root and its dependencies into the partition, tracking only
+    // newly inserted nodes when updating the balancing queue.
     auto &FnsInPart = Partitions[PID];
     CostType AddedCost = 0;
-    for (const Function *Dep : CurFn.Dependencies)
-      if (FnsInPart.insert(Dep).second)
-        AddedCost += FuncsCosts.lookup(Dep);
+    for (unsigned NodeID : Entry.Nodes.set_bits()) {
+      const auto &Node = Graph->getNode(NodeID);
+      if (FnsInPart.insert(&Node.getFunction()).second)
+        AddedCost += Node.getIndividualCost();
+    }
 
     // Update the cost of the selected partition, which is the entry at the
     // back of the sorted queue, before re-sorting.
@@ -116,24 +113,52 @@ std::vector<DenseSet<const Function *>> SplitModuleCG::doPartitioning() {
   return Partitions;
 }
 
-void SplitModuleCG::calculateFunctionCosts() {
-  ModuleCost = 0;
-  for (auto &Fn : M) {
-    if (Fn.isDeclaration())
+void SplitModuleCG::buildGraph() {
+  splitmodule::FunctionCostMap FunctionCosts;
+  CostType ModuleCost = splitmodule::calculateFunctionCosts(
+      M,
+      [](Function &F) {
+        CostType Cost = 0;
+        for (const BasicBlock &BB : F)
+          Cost += std::distance(BB.begin(), BB.end());
+        return Cost;
+      },
+      FunctionCosts);
+
+  Graph = std::make_unique<splitmodule::Graph>(M, ModuleCost);
+  for (const Function &F : M)
+    if (!F.isDeclaration())
+      Graph->getOrInsertNode(F, FunctionCosts.at(&F));
+
+  for (auto &NodePair : CG) {
+    CallGraphNode &CGNode = *NodePair.second;
+    Function *F = CGNode.getFunction();
+    if (!F || F->isDeclaration())
       continue;
 
-    CostType FnCost = 0;
-    for (const auto &BB : Fn)
-      FnCost += std::distance(BB.begin(), BB.end());
-    assert(FnCost != 0);
-    FuncsCosts[&Fn] = FnCost;
-    // Signed overflow is UB, so perform the check in unsigned arithmetic,
-    // where wraparound is well-defined.
-    assert(static_cast<uint64_t>(ModuleCost) + static_cast<uint64_t>(FnCost) >=
-               static_cast<uint64_t>(ModuleCost) &&
-           "Overflow!");
-    ModuleCost += FnCost;
+    splitmodule::Graph::Node &Node = Graph->getNode(*F);
+    for (const auto &CallRecord : CGNode) {
+      Function *Callee = CallRecord.second->getFunction();
+      if (!Callee || Callee->isDeclaration())
+        continue;
+      Graph->addEdge(Node, Graph->getNode(*Callee),
+                     splitmodule::Graph::EdgeKind::DirectCall);
+    }
   }
+
+#ifndef NDEBUG
+  if (EnablePrintSimplifiedCallGraph)
+    for (const splitmodule::Graph::Node *Node : Graph->nodes()) {
+      LLVM_DEBUG(dbgs() << "Call graph node for function: '" << Node->getName()
+                        << "' #uses="
+                        << std::distance(Node->incoming_edges().begin(),
+                                         Node->incoming_edges().end())
+                        << "\n");
+      for (const splitmodule::Graph::Edge *Edge : Node->outgoing_edges())
+        LLVM_DEBUG(dbgs() << "          Calls function : '"
+                          << Edge->Dst->getName() << " '\n");
+    }
+#endif
 }
 
 void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I) {
@@ -188,105 +213,73 @@ void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I) {
 #endif
 }
 
-FunctionWithDependencies::FunctionWithDependencies(
-    SimplifiedCallGraph &SCG,
-    const DenseMap<const Function *, CostType> &FnCosts, const Function *F)
-    : F(F) {
-  assert(!F->isDeclaration());
-
-  // Collect F and all non-declaration functions transitively called by F.
-  SmallVector<const Function *> WorkList({F});
-  Dependencies.insert(F);
-
-  while (!WorkList.empty()) {
-    const auto *CurFn = WorkList.pop_back_val();
-    assert(!CurFn->isDeclaration());
-
-    // Walk the callees of CurFn recorded in SimplifiedCallGraph and
-    // add them to Dependencies, recursing transitively via the WorkList.
-    for (auto &SCGNode : *SCG.at(CurFn)) {
-      auto *Callee = SCGNode->getFunction();
-      if (!Callee || Callee->isDeclaration())
-        continue;
-      if (Dependencies.insert(Callee).second)
-        WorkList.push_back(Callee);
-    }
-  }
-
-  for (const auto *Dep : Dependencies)
-    TotalCost += FnCosts.lookup(Dep);
-}
-
 void SplitModuleCG::createWorkList() {
-  // First, find all the entry functions with an in-degree of 0
-  // (i.e., those that are not called by any function).
-  for (auto &SCGNode : SCG->values()) {
-    Function *F = SCGNode->getFunction();
-    if (F && SCGNode->getNumReferences() == 0)
-      EntryFuncs.insert(F);
-  }
+  BitVector SeenNodes = Graph->createNodesBitVector();
+  auto AddRoot = [&](splitmodule::Graph::Node &Root) {
+    Graph->markAsGraphEntry(Root);
+    BitVector Dependencies = Graph->createNodesBitVector();
+    Root.getDependencies(Dependencies);
+    WorkList.push_back({&Root.getFunction(), Dependencies,
+                        Graph->calculateCost(Dependencies)});
+    SeenNodes |= Dependencies;
+  };
 
-  // Second, find all the dependencies of each entry function.
-  for (auto *F : EntryFuncs)
-    FWDWorkList.emplace_back(*SCG, FuncsCosts, F);
+  // Start with ordinary roots (functions that have no incoming call edge).
+  for (splitmodule::Graph::Node *Node : Graph->nodes())
+    if (!Node->hasAnyIncomingEdges())
+      AddRoot(*Node);
 
-  // Third, find all the functions that are not in the worklist.
-  DenseSet<const Function *> SeenFunctions;
-  for (const auto &Fwd : FWDWorkList)
-    SeenFunctions.insert(Fwd.Dependencies.begin(), Fwd.Dependencies.end());
-  for (auto &F : M) {
-    // This function may be in a cycle, and therefore is not a dependency of
-    // any root, which is treated as a root function here.
-    if (F.isDeclaration() || SeenFunctions.contains(&F))
+  // A rootless call cycle is not reachable from the roots above. Select the
+  // first unseen member in module order as an additional root.
+  for (Function &F : M) {
+    if (F.isDeclaration())
       continue;
-    FWDWorkList.emplace_back(*SCG, FuncsCosts, &F);
-    auto &Fwd = FWDWorkList.back();
-    EntryFuncs.insert(&F);
-    SeenFunctions.insert(Fwd.Dependencies.begin(), Fwd.Dependencies.end());
+    splitmodule::Graph::Node &Node = Graph->getNode(F);
+    if (!SeenNodes.test(Node.getID()))
+      AddRoot(Node);
   }
+
+#ifndef NDEBUG
+  assert(Graph->verify());
+#endif
 }
 
 void SplitModuleCG::sortWorkList() {
   // Sort the worklist so the most expensive roots are seen first.
-  sort(FWDWorkList, [](const auto &A, const auto &B) {
+  sort(WorkList, [](const auto &A, const auto &B) {
     // Sort by total cost, and if the total cost is identical, sort
     // alphabetically
     if (A.TotalCost == B.TotalCost)
-      return A.F->getName() < B.F->getName();
+      return A.Root->getName() < B.Root->getName();
     return A.TotalCost > B.TotalCost;
   });
 
   LLVM_DEBUG(dbgs() << "Number of callgraphs to be allocated: "
-                    << FWDWorkList.size() << "   Module cost: " << ModuleCost
-                    << "\n");
+                    << WorkList.size()
+                    << "   Module cost: " << Graph->getModuleCost() << "\n");
   LLVM_DEBUG(dbgs() << "callgraphs: \n");
 #ifndef NDEBUG
-  for (auto &Fwd : FWDWorkList)
-    LLVM_DEBUG(dbgs() << "[root] " << Fwd.F->getName()
-                      << " (totalCost:" << Fwd.TotalCost
-                      << ";   root function cost: " << FuncsCosts[Fwd.F]
-                      << ";   has dependency: " << Fwd.Dependencies.size()
-                      << ")\n");
+  for (const WorkListEntry &Entry : WorkList)
+    LLVM_DEBUG(dbgs() << "[root] " << Entry.Root->getName() << " (totalCost:"
+                      << Entry.TotalCost << ";   root function cost: "
+                      << Graph->getCost(*Entry.Root) << ";   has dependency: "
+                      << Entry.Nodes.count() << ")\n");
 #endif
 }
 
-void SplitModuleCG::splitModule(ModuleCreationCallback ModuleCallback,
-                                ContextCreationCallback MakeCtx) {
-  for (Function &F : M) {
-    if (F.hasLocalLinkage() && F.hasOneUse() && !F.hasAddressTaken())
-      continue;
-    F.externalize();
-    // Record functions that may be defined in multiple partitions so that
-    // dealWithMpart can downgrade duplicates to available_externally.
+void SplitModuleCG::splitModule(ModuleCreationCallback ModuleCallback) {
+  splitmodule::externalize(M, [](const GlobalValue &GV) {
+    const auto *F = dyn_cast<Function>(&GV);
+    return !F || !F->hasLocalLinkage() || !F->hasOneUse() ||
+           F->hasAddressTaken();
+  });
+
+  // Record functions that may be defined in multiple partitions so that
+  // dealWithMpart can downgrade duplicate copies to available_externally.
+  for (Function &F : M)
     if (canDowngradeToAvailableExternally(F))
       ExternalFunction[&F] = true;
-  }
-  for (GlobalVariable &GV : M.globals())
-    GV.externalize();
-  for (GlobalAlias &GA : M.aliases())
-    GA.externalize();
-  for (GlobalIFunc &GI : M.ifuncs())
-    GI.externalize();
+
   // TODO: The verifier requires an alias to point to a definition and an
   // ifunc resolver to be a definition, but the aliasee/resolver may be
   // assigned to a different partition than its alias/ifunc. Handling this
@@ -299,7 +292,7 @@ void SplitModuleCG::splitModule(ModuleCreationCallback ModuleCallback,
   auto Partitions = doPartitioning();
   assert(Partitions.size() == NumPartitions);
 
-  auto ShouldCloneDefinition = [&](unsigned I, const GlobalValue *GV) {
+  auto ShouldCloneDefinition = [&](const GlobalValue *GV, unsigned I) {
     const auto &FnsInPart = Partitions[I];
 
     // Functions go in their assigned partition.
@@ -309,66 +302,16 @@ void SplitModuleCG::splitModule(ModuleCreationCallback ModuleCallback,
     return I == 0;
   };
 
-  // TODO: Consider parallelizing the per-partition CloneModule call itself.
-  // Today the loop below serially clones M into NumPartitions partitions in
-  // the main thread, then enqueues the opt+codegen work on a thread pool. If
-  // CloneModule becomes a bottleneck for large modules, the clones could be
-  // produced in parallel too — but that would require either per-thread
-  // LLVMContexts for the clone step or a thread-safe CloneModule, neither of
-  // which is straightforward. dealWithMpart's handling of duplicate
-  // definitions is also order-dependent: the first partition processed keeps
-  // the real definition of an externalized function and later ones downgrade
-  // their copies to available_externally. Parallelizing would make that
-  // choice non-deterministic unless the owner partition were pre-assigned.
-  DefaultThreadPool SplitThreadPool(
-      heavyweight_hardware_concurrency(NumPartitions));
-  for (unsigned I = 0; I < NumPartitions; ++I) {
-    ValueToValueMapTy VMap;
-    std::unique_ptr<Module> MPart(
-        CloneModule(M, VMap, [&](const GlobalValue *GV) {
-          return ShouldCloneDefinition(I, GV);
-        }));
+  SmallVector<unsigned> PartitionIds;
+  for (unsigned I = 0; I < NumPartitions; ++I)
+    PartitionIds.push_back(I);
 
-    // Keep the module inline asm only in the first partition: emitting it in
-    // every partition would duplicate its contents (and any symbols it
-    // defines) when the partition objects are linked together.
-    if (I != 0)
-      MPart->removeModuleInlineAsm();
-
-    dealWithMpart(*MPart, I);
-
-    // Serialize the cloned partition to bitcode and re-parse it inside the
-    // worker thread's own LLVMContext. This round-trip is required because
-    // LLVM's Module / LLVMContext are not safe to share across threads:
-    // CloneModule above runs in the main thread's context, but the worker
-    // thread created below needs its own context to run opt + codegen
-    // concurrently without racing on shared internal state. So bitcode
-    // serialization is the supported way to move a Module between contexts.
-    SmallString<0> BC;
-    raw_svector_ostream BCOS(BC);
-    WriteBitcodeToFile(*MPart, BCOS);
-    MPart.reset();
-    SplitThreadPool.async(
-        [&, I](SmallString<0> BC) {
-          // Each partition is parsed into its own context, created by the
-          // caller, as LLVMContext cannot be shared across threads.
-          std::unique_ptr<LLVMContext> Ctx = MakeCtx();
-          // Give each partition a distinct module name reflecting its index,
-          // so that diagnostics and debug output identify the partition.
-          std::string PartName = ("split-module-cg." + Twine(I)).str();
-          Expected<std::unique_ptr<Module>> MOrErr =
-              parseBitcodeFile(MemoryBufferRef(BC.str(), PartName), *Ctx);
-          BC = SmallString<0>();
-          if (!MOrErr)
-            report_fatal_error(MOrErr.takeError());
-          ModuleCallback(std::move(MOrErr.get()), I);
-        },
-        std::move(BC));
-  }
-  // The inner lambda (which runs in a worker thread) captures our local
-  // variables, so we need to wait for the worker threads to terminate before
-  // we can leave the function scope.
-  SplitThreadPool.wait();
+  splitmodule::materializePartitions(
+      M, PartitionIds, ShouldCloneDefinition,
+      [&](std::unique_ptr<Module> MPart, unsigned I) {
+        dealWithMpart(*MPart, I);
+        ModuleCallback(std::move(MPart), I);
+      });
 }
 
 SplitModuleCG::SplitModuleCG(Module &M, unsigned LimitPartition)
@@ -380,10 +323,7 @@ SplitModuleCG::SplitModuleCG(Module &M, unsigned LimitPartition)
     if (!GV.hasLocalLinkage())
       OriginalExternals.insert(GV.getName());
 
-  calculateFunctionCosts();
-
-  // Construct a simplified call graph to facilitate worklist generation.
-  SCG = std::make_unique<SimplifiedCallGraph>(CG);
+  buildGraph();
 
   // Populate the worklist with root functions and their transitive
   // dependencies. This worklist serves as the foundation for the
@@ -397,56 +337,11 @@ SplitModuleCG::SplitModuleCG(Module &M, unsigned LimitPartition)
     // partitions (and thus output objects).
     unsigned MaxPartitions =
         heavyweight_hardware_concurrency().compute_thread_count();
-    NumPartitions = std::min<unsigned>(EntryFuncs.size(), MaxPartitions);
-  } else if (NumPartitions > EntryFuncs.size()) {
+    NumPartitions = std::min<unsigned>(WorkList.size(), MaxPartitions);
+  } else if (NumPartitions > WorkList.size()) {
     // Do not create more partitions than there are call-graph roots.
-    NumPartitions = EntryFuncs.size();
+    NumPartitions = WorkList.size();
   }
   if (NumPartitions == 0)
     NumPartitions = 1;
-}
-
-SimplifiedCallGraph::SimplifiedCallGraph(CallGraph &CG) {
-  for (auto &NodePair : CG) {
-    auto &CGNode = NodePair.second;
-    Function *F = CGNode->getFunction();
-    if (!F || F->isDeclaration())
-      continue;
-
-    SimplifiedCallGraphNode *SCGNode = getOrInsertFunction(F);
-
-    for (const auto &CGNodeItem : *CGNode) {
-      Function *Called = CGNodeItem.second->getFunction();
-      if (!Called || Called->isDeclaration())
-        continue;
-      SCGNode->addCalledFunction(getOrInsertFunction(Called));
-    }
-  }
-
-  if (EnablePrintSimplifiedCallGraph)
-    print();
-}
-
-void SimplifiedCallGraph::print() {
-#ifndef NDEBUG
-  for (auto &SCGItem : FunctionMap) {
-    LLVM_DEBUG(dbgs() << "Call graph node for function: '"
-                      << SCGItem.first->getName() << "' #uses="
-                      << SCGItem.second->getNumReferences() << "\n");
-
-    for (const auto &Callee : *SCGItem.second)
-      LLVM_DEBUG(dbgs() << "          Calls function : '"
-                        << Callee->getFunction()->getName() << " '\n");
-  }
-#endif
-}
-
-SimplifiedCallGraphNode *
-SimplifiedCallGraph::getOrInsertFunction(const Function *F) {
-  auto &SCGN = FunctionMap[F];
-  if (SCGN)
-    return SCGN.get();
-
-  SCGN = std::make_unique<SimplifiedCallGraphNode>(const_cast<Function *>(F));
-  return SCGN.get();
 }
