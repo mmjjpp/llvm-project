@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Utils/SplitModuleCG.h"
+#include "llvm/Analysis/CallGraph.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Module.h"
@@ -27,12 +28,6 @@ using namespace llvm;
 static cl::opt<bool> EnablePrintSimplifiedCallGraph(
     "enable-print-simplified-callgraph", cl::Hidden, cl::init(false),
     cl::desc("print the module splitting graph"));
-
-namespace {
-
-using PartitionID = unsigned;
-
-} // namespace
 
 /// Returns whether duplicate definitions of \p F across partitions may be
 /// downgraded to available_externally. This is safe for external functions
@@ -69,51 +64,23 @@ static std::string computeFallbackSuffix(const Module &M) {
   return ("." + Str).str();
 }
 
-std::vector<DenseSet<const Function *>> SplitModuleCG::doPartitioning() {
+std::vector<splitmodule::Partition> SplitModuleCG::doPartitioning() {
   LLVM_DEBUG(dbgs() << "\n--Partitioning Starts--\n");
   assert(NumPartitions != 0 && "Partition count must be at least 1");
-  std::vector<DenseSet<const Function *>> Partitions;
-  Partitions.resize(NumPartitions);
-
-  auto ComparePartitions = [](const std::pair<PartitionID, CostType> &LHS,
-                              const std::pair<PartitionID, CostType> &RHS) {
-    // When two partitions have the same cost, assign to the one with the
-    // biggest ID first. This allows us to put things in P0 last, because P0 may
-    // have other stuff added later.
-    if (LHS.second == RHS.second)
-      return LHS.first < RHS.first;
-    return LHS.second > RHS.second;
-  };
-
-  std::vector<std::pair<PartitionID, CostType>> BalancingQueue;
-  for (unsigned I = 0; I < NumPartitions; ++I)
-    BalancingQueue.emplace_back(I, 0);
+  std::vector<splitmodule::Partition> Partitions(
+      NumPartitions, splitmodule::Partition(*Graph));
 
   for (const WorkListEntry &Entry : WorkList) {
-    // Normal "load-balancing", assign to partition with least pressure.
-    auto [PID, _] = BalancingQueue.back();
-
-    // Insert the root and its dependencies into the partition, tracking only
-    // newly inserted nodes when updating the balancing queue.
-    auto &FnsInPart = Partitions[PID];
-    CostType AddedCost = 0;
-    for (unsigned NodeID : Entry.Nodes.set_bits()) {
-      const auto &Node = Graph->getNode(NodeID);
-      if (FnsInPart.insert(&Node.getFunction()).second)
-        AddedCost += Node.getIndividualCost();
-    }
-
-    // Update the cost of the selected partition, which is the entry at the
-    // back of the sorted queue, before re-sorting.
-    BalancingQueue.back().second += AddedCost;
-
-    sort(BalancingQueue, ComparePartitions);
+    // Prefer the highest ID on cost ties, leaving P0 for things added later.
+    unsigned PID = splitmodule::findCheapestPartition(Partitions);
+    Partitions[PID].add(Entry.Nodes);
   }
 
   return Partitions;
 }
 
 void SplitModuleCG::buildGraph() {
+  CallGraph CG(M);
   splitmodule::FunctionCostMap FunctionCosts;
   CostType ModuleCost = splitmodule::calculateFunctionCosts(
       M,
@@ -161,7 +128,8 @@ void SplitModuleCG::buildGraph() {
 #endif
 }
 
-void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I) {
+void SplitModuleCG::finalizePartition(Module &MPart, unsigned I,
+                                      StringRef Suffix) {
   // Downgrade duplicate definitions of external functions to
   // available_externally. The first partition to define such a function keeps
   // the real definition; all other partitions get available_externally copies.
@@ -171,13 +139,14 @@ void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I) {
     // Look up the corresponding function in the original module M to check
     // its ExternalFunction status.
     auto *OrigFn = M.getFunction(PartFunc.getName());
-    if (!ExternalFunction.contains(OrigFn))
+    auto It = ExternalFunction.find(OrigFn);
+    if (It == ExternalFunction.end())
       continue;
-    if (!ExternalFunction[OrigFn]) {
+    if (!It->second) {
       PartFunc.setLinkage(GlobalValue::AvailableExternallyLinkage);
       PartFunc.setComdat(nullptr);
     } else {
-      ExternalFunction[OrigFn] = false;
+      It->second = false;
     }
   }
 
@@ -192,9 +161,6 @@ void SplitModuleCG::dealWithMpart(Module &MPart, unsigned I) {
   // an external that happens to share the same name. The suffix is derived
   // from the module via getUniqueModuleId, so it is consistent across all
   // partitions.
-  std::string Suffix = getUniqueModuleId(&M);
-  if (Suffix.empty())
-    Suffix = computeFallbackSuffix(M);
   for (auto &GV : MPart.global_values()) {
     // Only rename symbols that were promoted from internal to external: skip
     // those that are still internal, and those that were already external in
@@ -219,9 +185,10 @@ void SplitModuleCG::createWorkList() {
     Graph->markAsGraphEntry(Root);
     BitVector Dependencies = Graph->createNodesBitVector();
     Root.getDependencies(Dependencies);
-    WorkList.push_back({&Root.getFunction(), Dependencies,
-                        Graph->calculateCost(Dependencies)});
+    CostType TotalCost = Graph->calculateCost(Dependencies);
     SeenNodes |= Dependencies;
+    WorkList.push_back(
+        {&Root.getFunction(), std::move(Dependencies), TotalCost});
   };
 
   // Start with ordinary roots (functions that have no incoming call edge).
@@ -275,7 +242,7 @@ void SplitModuleCG::splitModule(ModuleCreationCallback ModuleCallback) {
   });
 
   // Record functions that may be defined in multiple partitions so that
-  // dealWithMpart can downgrade duplicate copies to available_externally.
+  // finalizePartition can downgrade duplicate copies to available_externally.
   for (Function &F : M)
     if (canDowngradeToAvailableExternally(F))
       ExternalFunction[&F] = true;
@@ -292,12 +259,15 @@ void SplitModuleCG::splitModule(ModuleCreationCallback ModuleCallback) {
   auto Partitions = doPartitioning();
   assert(Partitions.size() == NumPartitions);
 
-  auto ShouldCloneDefinition = [&](const GlobalValue *GV, unsigned I) {
-    const auto &FnsInPart = Partitions[I];
+  // Compute once from the prepared source module and share across partitions.
+  std::string Suffix = getUniqueModuleId(&M);
+  if (Suffix.empty())
+    Suffix = computeFallbackSuffix(M);
 
+  auto ShouldCloneDefinition = [&](const GlobalValue *GV, unsigned I) {
     // Functions go in their assigned partition.
     if (const auto *FnToClone = dyn_cast<Function>(GV))
-      return FnsInPart.contains(FnToClone);
+      return Partitions[I].contains(*FnToClone);
     // Everything else goes in the first partition.
     return I == 0;
   };
@@ -309,13 +279,14 @@ void SplitModuleCG::splitModule(ModuleCreationCallback ModuleCallback) {
   splitmodule::materializePartitions(
       M, PartitionIds, ShouldCloneDefinition,
       [&](std::unique_ptr<Module> MPart, unsigned I) {
-        dealWithMpart(*MPart, I);
+        finalizePartition(*MPart, I, Suffix);
         ModuleCallback(std::move(MPart), I);
-      });
+      },
+      splitmodule::ModuleAsmPolicy::PreserveFirst);
 }
 
 SplitModuleCG::SplitModuleCG(Module &M, unsigned LimitPartition)
-    : NumPartitions(LimitPartition), M(M), CG(M) {
+    : NumPartitions(LimitPartition), M(M) {
   // Track existing non-local symbols. This ensures that when we promote
   // internal symbols to external for partitioning, we can handle renaming
   // and avoid conflicts.

@@ -287,5 +287,6 @@ void llvm::SplitModule(
       M, PartitionIds, ShouldCloneDefinition,
       [&](std::unique_ptr<Module> MPart, unsigned) {
         ModuleCallback(std::move(MPart));
-      });
+      },
+      splitmodule::ModuleAsmPolicy::PreserveFirst);
 }

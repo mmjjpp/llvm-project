@@ -16,14 +16,12 @@
 #define LLVM_TRANSFORMS_UTILS_SPLITMODULECG_H
 
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSet.h"
-#include "llvm/Analysis/CallGraph.h"
 #include "llvm/Support/Compiler.h"
-#include "llvm/Support/InstructionCost.h"
 #include "llvm/Transforms/Utils/SplitModuleUtils.h"
 
 #include <memory>
+#include <vector>
 
 namespace llvm {
 
@@ -39,7 +37,7 @@ namespace llvm {
 ///   2. sortWorkList(): sorts the worklist by accumulated cost.
 ///   3. doPartitioning(): greedily assigns each root + dependencies to the
 ///      least-loaded partition.
-///   4. Per partition: CloneModule, then dealWithMpart downgrades duplicate
+///   4. Per partition: CloneModule, then finalizePartition downgrades duplicate
 ///      definitions to available_externally, erases unused declarations,
 ///      and renames promoted locals with a common per-module suffix.
 ///   5. Emits each partition synchronously through ModuleCreationCallback.
@@ -67,7 +65,7 @@ public:
   unsigned getPartitionNum() const { return NumPartitions; }
 
 private:
-  using CostType = InstructionCost::CostType;
+  using CostType = splitmodule::FunctionCost;
 
   struct WorkListEntry {
     const Function *Root = nullptr;
@@ -78,12 +76,11 @@ private:
   /// Number of partitions to produce; finalized in the constructor.
   unsigned NumPartitions;
   Module &M;
-  CallGraph CG;
   std::unique_ptr<splitmodule::Graph> Graph;
   /// Names of GVs already external before externalize; excluded from renaming.
   StringSet<> OriginalExternals;
   /// Tracks functions that may be defined in multiple partitions so that
-  /// dealWithMpart can downgrade duplicates to available_externally:
+  /// finalizePartition can downgrade duplicates to available_externally:
   ///   - Membership: the definition is safely downgradable (see
   ///     canDowngradeToAvailableExternally); absent functions are untouched.
   ///   - The mapped bool: true until the first partition holding the
@@ -98,8 +95,8 @@ private:
 
   /// Walk WorkList in cost-sorted order and greedily assign each root and
   /// its dependencies to the partition with the lowest accumulated cost
-  /// (load-balanced bin-packing). Returns one set per partition.
-  std::vector<DenseSet<const Function *>> doPartitioning();
+  /// (load-balanced bin-packing). Returns one node set and cost per partition.
+  std::vector<splitmodule::Partition> doPartitioning();
 
   /// Post-process a cloned partition \p MPart (partition index \p I):
   ///   - Downgrade duplicate definitions of originally-external functions to
@@ -107,7 +104,7 @@ private:
   ///   - Erase declarations that are no longer used.
   ///   - Rename promoted local symbols (now external, not in OriginalExternals)
   ///     to "name.llvm.<suffix>" to avoid duplicate symbols across partitions.
-  void dealWithMpart(Module &MPart, unsigned I);
+  void finalizePartition(Module &MPart, unsigned I, StringRef Suffix);
 
   /// Discover graph roots and build WorkList. Functions in rootless cycles are
   /// treated as roots themselves.

@@ -277,13 +277,11 @@ static void buildSplitGraph(SplitGraph &SG, CallGraph &CG,
   // We build the graph by just iterating all functions in the module and
   // working on their direct callees. At the end, all nodes should be linked
   // together as expected.
+  auto GetNode = [&](const Function &Fn) -> SplitGraph::Node & {
+    return SG.getOrInsertNode(Fn, CostMap.at(&Fn), isNonCopyable(Fn),
+                              AMDGPU::isEntryFunctionCC(Fn.getCallingConv()));
+  };
   SmallVector<const Function *> FnsWithIndirectCalls, IndirectlyCallableFns;
-  for (const Function &Fn : SG.getModule()) {
-    if (!Fn.isDeclaration())
-      SG.getOrInsertNode(Fn, CostMap.at(&Fn), isNonCopyable(Fn),
-                         AMDGPU::isEntryFunctionCC(Fn.getCallingConv()));
-  }
-
   for (const Function &Fn : SG.getModule()) {
     if (Fn.isDeclaration())
       continue;
@@ -341,9 +339,11 @@ static void buildSplitGraph(SplitGraph &SG, CallGraph &CG,
         DirectCallees.insert_range(KnownCallees);
     }
 
-    SplitGraph::Node &N = SG.getNode(Fn);
+    // Preserve first-encounter node numbering: callees may receive IDs before
+    // their position in module order. Cluster ordering uses these IDs.
+    SplitGraph::Node &N = GetNode(Fn);
     for (const auto *Callee : DirectCallees)
-      SG.addEdge(N, SG.getNode(*Callee), SplitGraph::EdgeKind::DirectCall);
+      SG.addEdge(N, GetNode(*Callee), SplitGraph::EdgeKind::DirectCall);
 
     if (canBeIndirectlyCalled(Fn))
       IndirectlyCallableFns.push_back(&Fn);
@@ -352,8 +352,8 @@ static void buildSplitGraph(SplitGraph &SG, CallGraph &CG,
   // Post-process functions with indirect calls.
   for (const Function *Fn : FnsWithIndirectCalls) {
     for (const Function *Candidate : IndirectlyCallableFns) {
-      SplitGraph::Node &Src = SG.getNode(*Fn);
-      SplitGraph::Node &Dst = SG.getNode(*Candidate);
+      SplitGraph::Node &Src = GetNode(*Fn);
+      SplitGraph::Node &Dst = GetNode(*Candidate);
       SG.addEdge(Src, Dst, SplitGraph::EdgeKind::IndirectCall);
     }
   }
@@ -405,19 +405,28 @@ static void buildSplitGraph(SplitGraph &SG, CallGraph &CG,
 class SplitProposal {
 public:
   SplitProposal(const SplitGraph &SG, unsigned MaxPartitions) : SG(&SG) {
-    Partitions.resize(MaxPartitions, {0, SG.createNodesBitVector()});
+    Partitions.resize(MaxPartitions, splitmodule::Partition(SG));
   }
 
   void setName(StringRef NewName) { Name = NewName; }
   StringRef getName() const { return Name; }
 
   const BitVector &operator[](unsigned PID) const {
-    return Partitions[PID].second;
+    return Partitions[PID].getNodes();
   }
 
   void add(unsigned PID, const BitVector &BV) {
-    Partitions[PID].second |= BV;
-    updateScore(PID);
+    TotalCost -= Partitions[PID].getCost();
+    Partitions[PID].add(BV);
+    TotalCost += Partitions[PID].getCost();
+  }
+
+  bool contains(unsigned PID, const Function &F) const {
+    return Partitions[PID].contains(F);
+  }
+
+  CostType getPartitionCost(unsigned PID) const {
+    return Partitions[PID].getCost();
   }
 
   void print(raw_ostream &OS) const;
@@ -460,15 +469,6 @@ public:
   double getBottleneckScore() const { return BottleneckScore; }
 
 private:
-  void updateScore(unsigned PID) {
-    assert(SG);
-    for (auto &[PCost, Nodes] : Partitions) {
-      TotalCost -= PCost;
-      PCost = SG->calculateCost(Nodes);
-      TotalCost += PCost;
-    }
-  }
-
   /// \see getCodeSizeScore
   double CodeSizeScore = 0.0;
   /// \see getBottleneckScore
@@ -479,7 +479,7 @@ private:
   const SplitGraph *SG = nullptr;
   std::string Name;
 
-  std::vector<std::pair<CostType, BitVector>> Partitions;
+  std::vector<splitmodule::Partition> Partitions;
 };
 
 void SplitProposal::print(raw_ostream &OS) const {
@@ -489,24 +489,14 @@ void SplitProposal::print(raw_ostream &OS) const {
      << ", code size score:" << format("%0.3f", CodeSizeScore)
      << ", bottleneck score:" << format("%0.3f", BottleneckScore) << '\n';
   for (const auto &[PID, Part] : enumerate(Partitions)) {
-    const auto &[Cost, NodeIDs] = Part;
-    OS << "  - P" << PID << " nodes:" << NodeIDs.count() << " cost: " << Cost
-       << '|' << formatRatioOf(Cost, SG->getModuleCost()) << "%\n";
+    OS << "  - P" << PID << " nodes:" << Part.getNodes().count()
+       << " cost: " << Part.getCost() << '|'
+       << formatRatioOf(Part.getCost(), SG->getModuleCost()) << "%\n";
   }
 }
 
 unsigned SplitProposal::findCheapestPartition() const {
-  assert(!Partitions.empty());
-  CostType CurCost = std::numeric_limits<CostType>::max();
-  unsigned CurPID = InvalidPID;
-  for (const auto &[Idx, Part] : enumerate(Partitions)) {
-    if (Part.first <= CurCost) {
-      CurPID = Idx;
-      CurCost = Part.first;
-    }
-  }
-  assert(CurPID != InvalidPID);
-  return CurPID;
+  return splitmodule::findCheapestPartition(Partitions);
 }
 
 void SplitProposal::calculateScores() {
@@ -515,10 +505,9 @@ void SplitProposal::calculateScores() {
 
   assert(SG);
   CostType LargestPCost = 0;
-  for (auto &[PCost, Nodes] : Partitions) {
-    if (PCost > LargestPCost)
-      LargestPCost = PCost;
-  }
+  for (const auto &Part : Partitions)
+    if (Part.getCost() > LargestPCost)
+      LargestPCost = Part.getCost();
 
   CostType ModuleCost = SG->getModuleCost();
   CodeSizeScore = double(TotalCost) / ModuleCost;
@@ -535,9 +524,9 @@ void SplitProposal::verifyCompleteness() const {
   if (Partitions.empty())
     return;
 
-  BitVector Result = Partitions[0].second;
+  BitVector Result = Partitions[0].getNodes();
   for (const auto &P : drop_begin(Partitions))
-    Result |= P.second;
+    Result |= P.getNodes();
   assert(Result.all() && "some nodes are missing from this proposal!");
 }
 #endif
@@ -1132,19 +1121,10 @@ static void splitAMDGPUModule(
              << "' - Partition summaries will not be printed\n";
   }
 
-  std::vector<DenseSet<const Function *>> FunctionsInPartitions(NumParts);
-  SmallVector<CostType> PartitionCosts(NumParts, 0);
   SmallVector<unsigned> PartitionIds;
   for (unsigned PID = 0; PID < NumParts; ++PID) {
-    auto &FnsInPart = FunctionsInPartitions[PID];
-    for (unsigned NodeID : (*Proposal)[PID].set_bits()) {
-      const Function &F = SG.getNode(NodeID).getFunction();
-      FnsInPart.insert(&F);
-      PartitionCosts[PID] += SG.getCost(F);
-    }
-
     // Don't create empty modules.
-    if (FnsInPart.empty()) {
+    if ((*Proposal)[PID].none()) {
       LLVM_DEBUG(dbgs() << "[split] P" << PID
                         << " is empty, not creating module\n");
       continue;
@@ -1155,16 +1135,14 @@ static void splitAMDGPUModule(
 
   const unsigned PrimaryPartition = PartitionIds.front();
   auto ShouldCloneDefinition = [&](const GlobalValue *GV, unsigned PID) {
-    const auto &FnsInPart = FunctionsInPartitions[PID];
-
     // Functions go in their assigned partition.
     if (const auto *Fn = dyn_cast<Function>(GV))
-      return FnsInPart.contains(Fn);
+      return Proposal->contains(PID, *Fn);
 
     // Aliases should not be separated from their underlying object.
     if (const auto *GA = dyn_cast<GlobalAlias>(GV))
       if (const auto *Fn = dyn_cast<Function>(GA->getAliaseeObject()))
-        return FnsInPart.contains(Fn);
+        return Proposal->contains(PID, *Fn);
 
     // Everything else goes in the first non-empty module we create.
     return PID == PrimaryPartition || needsConservativeImport(GV);
@@ -1182,14 +1160,15 @@ static void splitAMDGPUModule(
             GV.eraseFromParent();
 
         if (SummariesOS)
-          printPartitionSummary(*SummariesOS, PID, *MPart, PartitionCosts[PID],
-                                ModuleCost);
+          printPartitionSummary(*SummariesOS, PID, *MPart,
+                                Proposal->getPartitionCost(PID), ModuleCost);
 
-        LLVM_DEBUG(printPartitionSummary(dbgs(), PID, *MPart,
-                                         PartitionCosts[PID], ModuleCost));
+        LLVM_DEBUG(printPartitionSummary(
+            dbgs(), PID, *MPart, Proposal->getPartitionCost(PID), ModuleCost));
 
         ModuleCallback(std::move(MPart));
-      });
+      },
+      splitmodule::ModuleAsmPolicy::PreserveAll);
 }
 } // namespace
 

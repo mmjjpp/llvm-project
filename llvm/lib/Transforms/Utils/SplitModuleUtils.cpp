@@ -63,11 +63,10 @@ Graph::Node &Graph::getOrInsertNode(const Function &F, FunctionCost Cost,
     return N;
   }
 
-  std::unique_ptr<Node> N(
-      new Node(Nodes.size(), F, Cost, IsNonCopyable, FollowIndirectEdges));
-  It->second = N.get();
-  Nodes.push_back(N.get());
-  NodeStorage.push_back(std::move(N));
+  Node *N = new (NodesPool.Allocate())
+      Node(Nodes.size(), F, Cost, IsNonCopyable, FollowIndirectEdges);
+  It->second = N;
+  Nodes.push_back(N);
   return *It->second;
 }
 
@@ -78,7 +77,14 @@ Graph::Node &Graph::getNode(const Function &F) {
 }
 
 const Graph::Node &Graph::getNode(const Function &F) const {
-  return const_cast<Graph *>(this)->getNode(F);
+  const Node *N = findNode(F);
+  assert(N && "function has no module split graph node");
+  return *N;
+}
+
+const Graph::Node *Graph::findNode(const Function &F) const {
+  auto It = NodeMap.find(&F);
+  return It == NodeMap.end() ? nullptr : It->second;
 }
 
 const Graph::Edge &Graph::addEdge(Node &Src, Node &Dst, EdgeKind Kind) {
@@ -86,11 +92,10 @@ const Graph::Edge &Graph::addEdge(Node &Src, Node &Dst, EdgeKind Kind) {
     if (E->Dst == &Dst && E->Kind == Kind)
       return *E;
 
-  auto E = std::make_unique<Edge>(&Src, &Dst, Kind);
-  Src.OutgoingEdges.push_back(E.get());
-  Dst.IncomingEdges.push_back(E.get());
-  EdgeStorage.push_back(std::move(E));
-  return *EdgeStorage.back();
+  auto *E = new (EdgesPool.Allocate<Edge>(1)) Edge(&Src, &Dst, Kind);
+  Src.OutgoingEdges.push_back(E);
+  Dst.IncomingEdges.push_back(E);
+  return *E;
 }
 
 FunctionCost Graph::calculateCost(const BitVector &NodeBits) const {
@@ -98,6 +103,30 @@ FunctionCost Graph::calculateCost(const BitVector &NodeBits) const {
   for (unsigned NodeID : NodeBits.set_bits())
     Cost += getNode(NodeID).getIndividualCost();
   return Cost;
+}
+
+void Partition::add(const BitVector &AdditionalNodes) {
+  assert(AdditionalNodes.size() == Nodes.size() &&
+         "partition and dependency sets must use the same graph");
+  for (unsigned ID : AdditionalNodes.set_bits())
+    if (!Nodes.test(ID))
+      Cost += G->getNode(ID).getIndividualCost();
+  Nodes |= AdditionalNodes;
+}
+
+bool Partition::contains(const Function &F) const {
+  const Graph::Node *N = G->findNode(F);
+  return N && Nodes.test(N->getID());
+}
+
+unsigned
+llvm::splitmodule::findCheapestPartition(ArrayRef<Partition> Partitions) {
+  assert(!Partitions.empty() && "partition list must not be empty");
+  unsigned Cheapest = 0;
+  for (unsigned I = 1; I < Partitions.size(); ++I)
+    if (Partitions[I].getCost() <= Partitions[Cheapest].getCost())
+      Cheapest = I;
+  return Cheapest;
 }
 
 #ifndef NDEBUG
@@ -162,11 +191,12 @@ FunctionCost llvm::splitmodule::calculateFunctionCosts(
 }
 
 void llvm::splitmodule::materializePartitions(
-    Module &M, ArrayRef<unsigned> PartitionIds,
+    const Module &M, ArrayRef<unsigned> PartitionIds,
     function_ref<bool(const GlobalValue *GV, unsigned PartitionId)>
         ShouldCloneDefinition,
     function_ref<void(std::unique_ptr<Module> MPart, unsigned PartitionId)>
-        ModuleCallback) {
+        ModuleCallback,
+    ModuleAsmPolicy AsmPolicy) {
   bool IsFirstPartition = true;
   for (unsigned PartitionId : PartitionIds) {
     ValueToValueMapTy VMap;
@@ -174,7 +204,7 @@ void llvm::splitmodule::materializePartitions(
         CloneModule(M, VMap, [&](const GlobalValue *GV) {
           return ShouldCloneDefinition(GV, PartitionId);
         }));
-    if (!IsFirstPartition)
+    if (AsmPolicy == ModuleAsmPolicy::PreserveFirst && !IsFirstPartition)
       MPart->removeModuleInlineAsm();
     IsFirstPartition = false;
     ModuleCallback(std::move(MPart), PartitionId);

@@ -7,8 +7,9 @@
 //===----------------------------------------------------------------------===//
 //
 // This file defines policy-neutral infrastructure shared by module splitting
-// implementations. Splitting policies decide how to build the graph and assign
-// its nodes to partitions; this file owns graph storage and module cloning.
+// implementations. Callers supply graph construction, cost, partitioning, and
+// definition selection policies. This file provides graph storage, dependency
+// traversal, partition bookkeeping, and module cloning.
 //
 //===----------------------------------------------------------------------===//
 
@@ -21,11 +22,12 @@
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Allocator.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/InstructionCost.h"
 #include <cstdint>
 #include <memory>
-#include <vector>
+#include <type_traits>
 
 namespace llvm {
 
@@ -110,11 +112,15 @@ public:
   Graph(const Module &M, FunctionCost ModuleCost)
       : M(M), ModuleCost(ModuleCost) {}
 
+  /// Nodes receive IDs in insertion order. Callers control this order when
+  /// their partitioning strategy uses IDs to break ties.
   LLVM_ABI Node &getOrInsertNode(const Function &F, FunctionCost Cost,
                                  bool IsNonCopyable = false,
                                  bool FollowIndirectEdges = false);
   LLVM_ABI Node &getNode(const Function &F);
   LLVM_ABI const Node &getNode(const Function &F) const;
+  /// Returns null for declarations and other functions absent from the graph.
+  LLVM_ABI const Node *findNode(const Function &F) const;
   const Node &getNode(unsigned ID) const { return *Nodes[ID]; }
 
   LLVM_ABI const Edge &addEdge(Node &Src, Node &Dst, EdgeKind Kind);
@@ -142,9 +148,37 @@ private:
   FunctionCost ModuleCost;
   DenseMap<const Function *, Node *> NodeMap;
   SmallVector<Node *> Nodes;
-  std::vector<std::unique_ptr<Node>> NodeStorage;
-  std::vector<std::unique_ptr<Edge>> EdgeStorage;
+  SpecificBumpPtrAllocator<Node> NodesPool;
+  static_assert(std::is_trivially_destructible_v<Edge>);
+  BumpPtrAllocator EdgesPool;
 };
+
+/// A set of graph nodes assigned to one partition and their aggregate cost.
+/// Construct partitions after graph construction is complete. The graph must
+/// outlive its partitions and must not gain new nodes while they are in use.
+/// Copies are independent, allowing partitioning strategies to explore multiple
+/// assignments without changing the graph.
+class Partition {
+public:
+  explicit Partition(const Graph &G) : G(&G), Nodes(G.createNodesBitVector()) {}
+
+  const BitVector &getNodes() const { return Nodes; }
+  FunctionCost getCost() const { return Cost; }
+  bool empty() const { return Nodes.none(); }
+
+  /// Merge nodes into this partition, counting each node's cost only once.
+  LLVM_ABI void add(const BitVector &AdditionalNodes);
+  LLVM_ABI bool contains(const Function &F) const;
+
+private:
+  const Graph *G;
+  BitVector Nodes;
+  FunctionCost Cost = 0;
+};
+
+/// Find the least expensive partition, choosing the highest index on ties.
+/// Partitions must not be empty.
+LLVM_ABI unsigned findCheapestPartition(ArrayRef<Partition> Partitions);
 
 LLVM_ABI void
 externalize(Module &M,
@@ -154,15 +188,20 @@ LLVM_ABI FunctionCost calculateFunctionCosts(
     Module &M, function_ref<FunctionCost(Function &F)> CalculateFunctionCost,
     FunctionCostMap &FunctionCosts);
 
-/// Clone the selected definitions into each partition. The first materialized
-/// partition retains module-level inline assembly; later partitions do not.
-/// Scheduling and LLVMContext transfer belong to the caller.
+/// Control whether module-level inline assembly is copied into every output or
+/// only the first materialized partition (which need not have partition ID 0).
+enum class ModuleAsmPolicy { PreserveAll, PreserveFirst };
+
+/// Clone the selected definitions into each partition, in PartitionIds order.
+/// Scheduling, partition cleanup, and LLVMContext transfer belong to the
+/// caller.
 LLVM_ABI void materializePartitions(
-    Module &M, ArrayRef<unsigned> PartitionIds,
+    const Module &M, ArrayRef<unsigned> PartitionIds,
     function_ref<bool(const GlobalValue *GV, unsigned PartitionId)>
         ShouldCloneDefinition,
     function_ref<void(std::unique_ptr<Module> MPart, unsigned PartitionId)>
-        ModuleCallback);
+        ModuleCallback,
+    ModuleAsmPolicy AsmPolicy);
 
 } // namespace splitmodule
 } // namespace llvm
